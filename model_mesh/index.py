@@ -1,0 +1,271 @@
+"""model-mesh: the model index.
+
+SQLite-backed persistent memory of every model ever seen, every probe and real
+request outcome, and current circuit-breaker state. The router consults this on
+every request; discovery updates it daily; real traffic updates it for free.
+
+Design rules:
+- Models are NEVER deleted. A model that vanishes gets `eol_at` set — EOL is
+  data (the maverick 410 of 2026-07-27 is exactly what we want a record of).
+- Real requests and synthetic probes land in the same `samples` table,
+  distinguished by `source`. Traffic is telemetry.
+- All writes go through this module; WAL mode so the daemon's reader threads
+  never block the writer.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import statistics
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS models (
+    id          TEXT PRIMARY KEY,        -- e.g. openai/gpt-oss-120b
+    provider    TEXT NOT NULL,           -- e.g. nim
+    first_seen  REAL NOT NULL,           -- unix ts of first catalog appearance
+    last_seen   REAL NOT NULL,           -- unix ts of latest catalog appearance
+    eol_at      REAL,                    -- set when it vanishes / 404s / 410s
+    eol_reason  TEXT                     -- 'catalog-drop' | 'http-410' | 'http-404'
+);
+CREATE TABLE IF NOT EXISTS samples (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id     TEXT NOT NULL,
+    ts           REAL NOT NULL,
+    op_class     TEXT NOT NULL,          -- retain | consolidation | reflect | generic
+    source       TEXT NOT NULL,          -- request | probe | discovery
+    latency_ms   REAL,                   -- NULL when the call never returned
+    status       TEXT NOT NULL,          -- 'ok' | 'http-429' | 'timeout' | 'parse-fail' | ...
+    payload_chars INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_samples_model_ts ON samples (model_id, ts);
+CREATE TABLE IF NOT EXISTS breaker (
+    model_id       TEXT PRIMARY KEY,
+    state          TEXT NOT NULL DEFAULT 'healthy',  -- healthy|down|recovering|auth|gone
+    consec_fails   INTEGER NOT NULL DEFAULT 0,
+    cooldown_until REAL NOT NULL DEFAULT 0,
+    cooldown_s     REAL NOT NULL DEFAULT 0,
+    updated_at     REAL NOT NULL DEFAULT 0
+);
+"""
+
+OK = "ok"
+
+
+@dataclass
+class Score:
+    model_id: str
+    score: float          # 0-100, higher = better
+    p95_ms: float
+    jitter: float         # stdev/median
+    spike_rate: float
+    success_rate: float
+    n: int
+
+
+class Index:
+    def __init__(self, db_path: str | Path):
+        self.path = Path(os.path.expanduser(str(db_path)))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    # -- catalog ------------------------------------------------------------
+
+    def sync_catalog(self, provider: str, live_ids: set[str]) -> dict:
+        """Reconcile the index against a live catalog listing.
+
+        Returns {'new': [...], 'eol': [...], 'returned': [...]}.
+        `returned` = models previously marked EOL that reappeared (it happens;
+        providers un-deprecate). Their eol_at is cleared but the history stays.
+        """
+        now = time.time()
+        new, eol, returned = [], [], []
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, eol_at FROM models WHERE provider = ?", (provider,)
+            )
+            known = {r[0]: r[1] for r in cur.fetchall()}
+            for mid in sorted(live_ids):
+                if mid not in known:
+                    self._conn.execute(
+                        "INSERT INTO models (id, provider, first_seen, last_seen)"
+                        " VALUES (?,?,?,?)",
+                        (mid, provider, now, now),
+                    )
+                    new.append(mid)
+                else:
+                    self._conn.execute(
+                        "UPDATE models SET last_seen=? WHERE id=?", (now, mid)
+                    )
+                    if known[mid] is not None:
+                        self._conn.execute(
+                            "UPDATE models SET eol_at=NULL, eol_reason=NULL"
+                            " WHERE id=?",
+                            (mid,),
+                        )
+                        self._set_breaker_locked(mid, "healthy", 0, 0, 0)
+                        returned.append(mid)
+            for mid in set(known) - live_ids:
+                if known[mid] is None:
+                    self._conn.execute(
+                        "UPDATE models SET eol_at=?, eol_reason='catalog-drop'"
+                        " WHERE id=?",
+                        (now, mid),
+                    )
+                    self._set_breaker_locked(mid, "gone", 0, 0, now)
+                    eol.append(mid)
+            self._conn.commit()
+        return {"new": new, "eol": eol, "returned": returned}
+
+    def mark_gone(self, model_id: str, reason: str) -> None:
+        """Request-time EOL: a 404/410 means gone NOW, not at next discovery."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE models SET eol_at=COALESCE(eol_at, ?), eol_reason=?"
+                " WHERE id=?",
+                (now, reason, model_id),
+            )
+            self._set_breaker_locked(model_id, "gone", 0, 0, now)
+            self._conn.commit()
+
+    def live_models(self, provider: Optional[str] = None) -> list[str]:
+        q = "SELECT id FROM models WHERE eol_at IS NULL"
+        args: tuple = ()
+        if provider:
+            q += " AND provider=?"
+            args = (provider,)
+        with self._lock:
+            return [r[0] for r in self._conn.execute(q, args).fetchall()]
+
+    # -- samples ------------------------------------------------------------
+
+    def record(
+        self,
+        model_id: str,
+        op_class: str,
+        source: str,
+        status: str,
+        latency_ms: Optional[float],
+        payload_chars: Optional[int] = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
+                " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
+                (model_id, time.time(), op_class, source, latency_ms, status,
+                 payload_chars),
+            )
+            self._conn.commit()
+
+    def last_sample_ts(self, model_id: str, op_class: str) -> float:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM samples WHERE model_id=? AND op_class=?",
+                (model_id, op_class),
+            ).fetchone()
+        return row[0] or 0.0
+
+    # -- scoring ------------------------------------------------------------
+
+    def score(
+        self, model_id: str, op_class: str, window_s: float = 86400.0
+    ) -> Optional[Score]:
+        """FCM-inspired stability score over the sliding window.
+
+        0.30 p95-latency + 0.30 jitter + 0.20 spike-rate + 0.20 success-rate.
+        Latency components are normalized against a 30s ceiling — anything at
+        or beyond that is 0. Returns None when there are no samples in-window
+        (an unknown model is neither good nor bad; the router probes it first).
+        """
+        cutoff = time.time() - window_s
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT latency_ms, status FROM samples"
+                " WHERE model_id=? AND op_class=? AND ts>=?",
+                (model_id, op_class, cutoff),
+            ).fetchall()
+        if not rows:
+            return None
+        oks = [r[0] for r in rows if r[1] == OK and r[0] is not None]
+        n = len(rows)
+        success_rate = len(oks) / n
+        if not oks:
+            return Score(model_id, 0.0, float("inf"), 1.0, 1.0, 0.0, n)
+
+        med = statistics.median(oks)
+        p95 = sorted(oks)[max(0, int(len(oks) * 0.95) - 1)]
+        jitter = (statistics.pstdev(oks) / med) if med > 0 else 1.0
+        spikes = sum(1 for v in oks if v > 3 * med)
+        spike_rate = spikes / len(oks)
+
+        ceil_ms = 30_000.0
+        lat_comp = max(0.0, 1.0 - (p95 / ceil_ms))
+        jit_comp = max(0.0, 1.0 - min(jitter, 1.0))
+        spk_comp = 1.0 - spike_rate
+        score = 100.0 * (
+            0.30 * lat_comp + 0.30 * jit_comp + 0.20 * spk_comp
+            + 0.20 * success_rate
+        )
+        return Score(model_id, round(score, 1), p95, round(jitter, 3),
+                     round(spike_rate, 3), round(success_rate, 3), n)
+
+    # -- breaker ------------------------------------------------------------
+
+    def _set_breaker_locked(
+        self, model_id: str, state: str, consec: int, cooldown_s: float,
+        cooldown_until: float,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO breaker (model_id, state, consec_fails, cooldown_until,"
+            " cooldown_s, updated_at) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(model_id) DO UPDATE SET state=excluded.state,"
+            " consec_fails=excluded.consec_fails,"
+            " cooldown_until=excluded.cooldown_until,"
+            " cooldown_s=excluded.cooldown_s, updated_at=excluded.updated_at",
+            (model_id, state, consec, cooldown_until, cooldown_s, time.time()),
+        )
+
+    def breaker_get(self, model_id: str) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state, consec_fails, cooldown_until, cooldown_s"
+                " FROM breaker WHERE model_id=?",
+                (model_id,),
+            ).fetchone()
+        if row is None:
+            return {"state": "healthy", "consec_fails": 0,
+                    "cooldown_until": 0.0, "cooldown_s": 0.0}
+        return {"state": row[0], "consec_fails": row[1],
+                "cooldown_until": row[2], "cooldown_s": row[3]}
+
+    def breaker_set(self, model_id: str, **fields) -> None:
+        cur = self.breaker_get(model_id)
+        cur.update(fields)
+        with self._lock:
+            self._set_breaker_locked(
+                model_id, cur["state"], cur["consec_fails"],
+                cur["cooldown_s"], cur["cooldown_until"],
+            )
+            self._conn.commit()
+
+    def breaker_all(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT model_id, state, consec_fails, cooldown_until, cooldown_s"
+                " FROM breaker"
+            ).fetchall()
+        return {
+            r[0]: {"state": r[1], "consec_fails": r[2],
+                   "cooldown_until": r[3], "cooldown_s": r[4]}
+            for r in rows
+        }
