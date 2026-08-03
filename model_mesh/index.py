@@ -200,7 +200,9 @@ class Index:
         n = len(rows)
         success_rate = len(oks) / n
         if not oks:
-            return Score(model_id, 0.0, float("inf"), 1.0, 1.0, 0.0, n)
+            # All failures in-window. p95 uses the 30s ceiling (not inf — the
+            # value must survive JSON serialization in /mesh/status).
+            return Score(model_id, 0.0, 30_000.0, 1.0, 1.0, 0.0, n)
 
         med = statistics.median(oks)
         p95 = sorted(oks)[max(0, int(len(oks) * 0.95) - 1)]
