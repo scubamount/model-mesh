@@ -11,6 +11,7 @@ health check could not fail while retain was down for a week; this one can.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -49,9 +50,14 @@ async def chat_completions(request: Request):
     model = (body.get("model") or "").strip()
     alias = _alias_cfg(model)
 
+    # Router I/O is blocking urllib — run it off the event loop, or one slow
+    # upstream call (30-90s on big payloads) freezes every endpoint including
+    # /health. Observed live 2026-08-03: /mesh/status returned http=000 while
+    # a retain was in flight.
     if alias is None:
-        # Raw model id: single call, breaker + telemetry still apply.
-        payload, att = ROUTER._call(model, body, "generic", "request")
+        payload, att = await asyncio.to_thread(
+            ROUTER._call, model, body, "generic", "request"
+        )
         if payload is not None:
             return JSONResponse(payload)
         return JSONResponse(
@@ -61,8 +67,9 @@ async def chat_completions(request: Request):
     op_class = alias.get("op_class", "retain")
     pool = candidates_for(INDEX, CFG["provider"]["name"], alias,
                           cap=alias.get("max_candidates"))
-    result = ROUTER.route(pool, body, op_class,
-                          probe_messages=probe_messages(op_class))
+    result = await asyncio.to_thread(
+        ROUTER.route, pool, body, op_class, probe_messages(op_class)
+    )
     if result.ok:
         resp = JSONResponse(result.response)
         resp.headers["x-mesh-routed-model"] = result.model_id or ""
@@ -97,10 +104,11 @@ async def health():
     """Deep health: catalog reachable AND >=1 healthy candidate per alias."""
     problems: dict[str, str] = {}
     try:
-        fetch_catalog(
+        await asyncio.to_thread(
+            fetch_catalog,
             CFG["provider"]["base_url"],
             os.environ.get(CFG["provider"]["api_key_env"], ""),
-            timeout=10.0,
+            10.0,
         )
     except Exception as e:  # noqa: BLE001
         problems["catalog"] = f"unreachable: {type(e).__name__}"
@@ -147,7 +155,8 @@ async def mesh_probe():
     if not _DISCOVERY_LOCK.acquire(blocking=False):
         return JSONResponse({"status": "already running"}, status_code=429)
     try:
-        report = discover(
+        report = await asyncio.to_thread(
+            discover,
             INDEX, ROUTER, CFG["provider"]["name"],
             CFG["provider"]["base_url"],
             os.environ.get(CFG["provider"]["api_key_env"], ""),
