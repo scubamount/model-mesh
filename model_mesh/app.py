@@ -21,7 +21,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .config import load_config
+from .config import load_config, resolve_api_key
 from .discovery import candidates_for, discover, fetch_catalog
 from .index import Index
 from .opclass import probe_messages
@@ -29,10 +29,17 @@ from .router import Router, RouterConfig
 
 CFG = load_config()
 INDEX = Index(CFG["db_path"])
+# Key resolver, not a cached string: read at CALL time from env, falling back
+# to ~/.hermes/.env. `launchctl setenv` does not survive a machine restart, so a
+# cached-at-import key meant the daemon 401'd every call until someone noticed.
+def _api_key() -> str:
+    return resolve_api_key(CFG["provider"]["api_key_env"])
+
+
 ROUTER = Router(
     INDEX,
     CFG["provider"]["base_url"],
-    os.environ.get(CFG["provider"]["api_key_env"], ""),
+    _api_key,
     RouterConfig(**CFG.get("router", {})),
 )
 _DISCOVERY_LOCK = threading.Lock()
@@ -107,7 +114,7 @@ async def health():
         await asyncio.to_thread(
             fetch_catalog,
             CFG["provider"]["base_url"],
-            os.environ.get(CFG["provider"]["api_key_env"], ""),
+            _api_key(),
             10.0,
         )
     except Exception as e:  # noqa: BLE001
@@ -168,7 +175,7 @@ async def mesh_probe():
             discover,
             INDEX, ROUTER, CFG["provider"]["name"],
             CFG["provider"]["base_url"],
-            os.environ.get(CFG["provider"]["api_key_env"], ""),
+            _api_key(),
             CFG["aliases"],
         )
         _audit(audit, {"ts": started, "ok": True,

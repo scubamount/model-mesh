@@ -270,3 +270,65 @@ def test_per_attempt_timeout_shrinks_to_remaining_budget(index):
                transport=capture)
     r.route(["m1", "m2", "m3"], {"messages": []}, "retain")
     assert seen and all(t <= 10.0 for t in seen)
+
+
+# --- credential-loss recovery (brick-class bug) ------------------------------
+
+def test_keyless_start_does_not_permanently_brick_every_model(index):
+    """auth used to be TERMINAL, and breaker state persists in SQLite. One
+    daemon start with a missing key (launchctl setenv does not survive a machine
+    restart) marked every model 'auth' forever: ranked() returned [] even after
+    a good key was restored, and restarting never healed it."""
+    keyless = Router(index, "http://up/v1", "",
+                     RouterConfig(auth_cooldown_s=0.01),
+                     transport=lambda u, b, h, t: (401, {"error": "unauthorized"}))
+    keyless.route(["m1", "m2", "m3"], {"messages": []}, "retain")
+    assert all(index.breaker_get(m)["state"] == "auth" for m in ("m1", "m2", "m3"))
+
+    time.sleep(0.02)                       # auth cooldown expires
+    fixed, _ = make_router(index)          # same DB, working transport
+    assert fixed.ranked(["m1", "m2", "m3"], "retain") != []
+    assert fixed.route(["m1"], {"messages": []}, "retain").ok
+
+
+def test_auth_is_skipped_while_cooling(index):
+    r = Router(index, "http://up/v1", "", RouterConfig(auth_cooldown_s=300.0),
+               transport=lambda u, b, h, t: (401, {}))
+    r.route(["m1"], {"messages": []}, "retain")
+    assert r.ranked(["m1"], "retain") == []      # not retried immediately
+
+
+def test_reprobe_arm_reconsiders_auth_models(index):
+    """A restored credential is exactly the stale-state case the re-probe arm
+    exists for, so 'auth' must not be excluded there."""
+    index.breaker_set("m1", state="auth", cooldown_until=time.time() + 9999)
+    r, t = make_router(index)
+    res = r.route(["m1"], {"messages": []}, "retain", probe_messages=PROBE)
+    assert res.ok and res.reprobed
+
+
+def test_api_key_read_at_call_time(index):
+    """Cached-at-import key ignored a credential fixed after startup."""
+    box = {"k": ""}
+    seen = []
+
+    def capture(url, body, headers, timeout):
+        seen.append(headers["Authorization"])
+        return 200, {"choices": [{"message": {"content": '{"facts":["x"]}'}}]}
+    r = Router(index, "http://up/v1", lambda: box["k"], RouterConfig(),
+               transport=capture)
+    r.route(["m1"], {"messages": []}, "retain")
+    box["k"] = "LATER-KEY"                       # fixed without a restart
+    r.route(["m1"], {"messages": []}, "retain")
+    assert seen == ["Bearer ", "Bearer LATER-KEY"]
+
+
+def test_resolve_api_key_falls_back_to_file(tmp_path, monkeypatch):
+    from model_mesh.config import resolve_api_key
+    f = tmp_path / ".env"
+    f.write_text('OTHER=1\nNVIDIA_API_KEY="file-key"\n')
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    assert resolve_api_key("NVIDIA_API_KEY", f) == "file-key"
+    monkeypatch.setenv("NVIDIA_API_KEY", "env-key")
+    assert resolve_api_key("NVIDIA_API_KEY", f) == "env-key"   # env wins
+    assert resolve_api_key("MISSING_VAR", f) == ""

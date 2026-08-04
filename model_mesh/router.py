@@ -43,6 +43,13 @@ class RouterConfig:
     reprobe_top_n: int = 3              # models re-probed on total miss
     request_timeout_s: float = 120.0
     probe_timeout_s: float = 30.0
+    # Auth failures must EXPIRE. They used to be terminal, and breaker state is
+    # persisted in SQLite, so a single daemon start with a missing key (launchctl
+    # setenv does not survive a restart of the machine) marked every model 'auth'
+    # permanently: ranked() returned [] even after a good key was restored, and
+    # no amount of restarting fixed it. A credential problem is the operator's
+    # to fix, but it must not brick the index.
+    auth_cooldown_s: float = 300.0
     # Sustained-failure floor. The consecutive-fail breaker cannot catch a model
     # that alternates ok/fail: gpt-oss-20b timed out 6 of 8 retain calls
     # (120s each) but never hit 3 in a row, so it stayed top-ranked and every
@@ -81,16 +88,23 @@ class Router:
         self,
         index: Index,
         upstream_base: str,
-        api_key: str,
+        api_key: str | Callable[[], str],
         cfg: Optional[RouterConfig] = None,
         # injectable for tests: (url, body, headers, timeout) -> (status, dict)
         transport: Optional[Callable] = None,
     ):
         self.index = index
         self.upstream_base = upstream_base.rstrip("/")
-        self.api_key = api_key
+        # Accept a callable so the key is read at CALL time, not import time.
+        # Cached-at-import meant a credential fixed after the daemon started was
+        # ignored until a full restart — and every call 401'd in the meantime.
+        self._api_key = api_key if callable(api_key) else (lambda: api_key)
         self.cfg = cfg or RouterConfig()
         self._transport = transport or self._http_post
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key() or ""
 
     # -- transport ----------------------------------------------------------
 
@@ -121,7 +135,13 @@ class Router:
 
     def _eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
-        if b["state"] in ("gone", "auth"):
+        if b["state"] == "gone":
+            return False
+        if b["state"] == "auth":
+            # Retry-after-cooldown, not terminal: see auth_cooldown_s.
+            if time.time() >= b["cooldown_until"]:
+                self.index.breaker_set(model_id, state="recovering")
+                return True
             return False
         if b["state"] == "down":
             if time.time() >= b["cooldown_until"]:
@@ -199,7 +219,11 @@ class Router:
             self.index.record(model_id, op_class, source, status, ms, payload_chars)
             return None, Attempt(model_id, status, ms, "gone: EOL'd at request time")
         if status_code in AUTH_CODES:
-            self.index.breaker_set(model_id, state="auth")
+            self.index.breaker_set(
+                model_id, state="auth", consec_fails=0,
+                cooldown_s=self.cfg.auth_cooldown_s,
+                cooldown_until=time.time() + self.cfg.auth_cooldown_s,
+            )
             self.index.record(model_id, op_class, source, status, ms, payload_chars)
             return None, Attempt(model_id, status, ms, "auth: check API key")
         if status_code in REJECT_CODES:
@@ -298,9 +322,10 @@ class Router:
                 if len(fresh) >= self.cfg.reprobe_top_n or _remaining() <= 1.0:
                     break
                 b = self.index.breaker_get(model_id)
-                # gone/auth stay excluded, but 'down' models ARE re-probed here:
-                # this arm exists precisely because breaker state may be stale.
-                if b["state"] in ("gone", "auth"):
+                # Only 'gone' is truly terminal. 'down' AND 'auth' models are
+                # re-probed here: this arm exists because persisted state may be
+                # stale, and a restored credential is exactly that case.
+                if b["state"] == "gone":
                     continue
                 if self.probe(model_id, op_class, probe_messages,
                               timeout=min(self.cfg.probe_timeout_s, _remaining())):
