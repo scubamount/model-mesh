@@ -197,3 +197,76 @@ def test_real_traffic_lands_in_index(index):
                  "retain")
     s = index.score("m1", "retain")
     assert s is not None and s.n == 1 and s.success_rate == 1.0
+
+
+# --- regressions from the 2026-08-04 live recheck ---------------------------
+
+def test_intermittent_model_skipped_by_success_floor(index):
+    """The consecutive-fail breaker CANNOT catch ok/fail alternating: live,
+    gpt-oss-20b timed out 6 of 8 retain calls at 120s each without ever hitting
+    3 in a row, stayed top-ranked, and every retain paid the timeout first."""
+    for i in range(8):
+        index.record("flaky", "retain", "request",
+                     OK if i % 4 == 0 else "timeout",
+                     100.0 if i % 4 == 0 else None)
+    router, t = make_router(index)
+    assert index.breaker_get("flaky")["state"] == "healthy"   # breaker blind
+    assert router.ranked(["flaky", "good"], "retain") == ["good"]  # floor catches
+
+
+def test_success_floor_is_per_op_class(index):
+    """nemotron-49b: 43% on retain (http-400) but 100% on consolidation. It must
+    stay eligible for the op_class it actually serves."""
+    for i in range(8):
+        index.record("m", "retain", "request",
+                     OK if i < 3 else "http-400", 200.0)
+    for _ in range(5):
+        index.record("m", "consolidation", "request", OK, 500.0)
+    router, t = make_router(index)
+    assert router.ranked(["m"], "retain") == []
+    assert router.ranked(["m"], "consolidation") == ["m"]
+
+
+def test_floor_needs_min_samples(index):
+    """One bad sample must not exile a model — that's what the breaker is for."""
+    index.record("new", "retain", "request", "timeout", None)
+    router, t = make_router(index)
+    assert router.ranked(["new"], "retain") == ["new"]
+
+
+def test_http_400_not_retried_and_not_breaker_counted(index):
+    router, t = make_router(index, {"m1": [(400, {"detail": "bad payload"})]})
+    res = router.route(["m1", "m2"], {"messages": []}, "retain")
+    assert res.ok and res.model_id == "m2"
+    b = index.breaker_get("m1")
+    assert b["state"] == "healthy" and b["consec_fails"] == 0   # not transient
+    assert "not retryable" in res.attempts[0].detail
+
+
+def test_cascade_respects_total_budget(index):
+    """3 x 120s = 360s overran hindsight's own 300s retain timeout, so the
+    client abandoned mid-cascade and failover never completed."""
+    def slow_transport(url, body, headers, timeout):
+        time.sleep(0.05)
+        return 500, {}
+    r = Router(index, "http://up/v1", "k",
+               RouterConfig(max_attempts=5, total_budget_s=0.12),
+               transport=slow_transport)
+    res = r.route(["m1", "m2", "m3", "m4", "m5"], {"messages": []}, "retain")
+    assert not res.ok
+    assert any(a.status == "skipped-budget" for a in res.attempts)
+    assert len(res.attempts) < 5          # stopped early, did not burn all 5
+
+
+def test_per_attempt_timeout_shrinks_to_remaining_budget(index):
+    seen = []
+
+    def capture(url, body, headers, timeout):
+        seen.append(timeout)
+        return 500, {}
+    r = Router(index, "http://up/v1", "k",
+               RouterConfig(max_attempts=3, request_timeout_s=120.0,
+                            total_budget_s=10.0),
+               transport=capture)
+    r.route(["m1", "m2", "m3"], {"messages": []}, "retain")
+    assert seen and all(t <= 10.0 for t in seen)

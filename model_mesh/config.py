@@ -33,6 +33,11 @@ DEFAULTS: dict = {
         "reprobe_top_n": 3,
         "request_timeout_s": 120.0,
         "probe_timeout_s": 45.0,
+        "min_success_rate": 0.5,
+        "min_samples_for_floor": 4,
+        # Under hindsight's 300s RETAIN_LLM_TIMEOUT so the client never abandons
+        # mid-cascade (see 060-hindsight-setup.sh).
+        "total_budget_s": 240.0,
     },
     "aliases": {
         "auto/retain": {

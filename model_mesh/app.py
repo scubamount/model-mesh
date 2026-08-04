@@ -115,7 +115,8 @@ async def health():
 
     for alias, cfg in CFG["aliases"].items():
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
-        healthy = [m for m in pool if ROUTER._eligible(m)]
+        oc = cfg.get("op_class", "retain")
+        healthy = [m for m in pool if ROUTER._eligible(m, oc)]
         if not healthy:
             problems[alias] = "no healthy candidates"
 
@@ -151,9 +152,17 @@ async def mesh_models():
 
 @app.post("/mesh/probe")
 async def mesh_probe():
-    """Force a discovery pass. Rate-limited to one at a time."""
+    """Force a discovery pass. Rate-limited to one at a time.
+
+    Always appends a JSONL audit record — including on failure. The launchd job
+    only captures curl's stdout, so a curl timeout (exit 28) left a 0-byte
+    discover.log and NO trace that discovery had failed. A job whose failure is
+    invisible is not a check.
+    """
     if not _DISCOVERY_LOCK.acquire(blocking=False):
         return JSONResponse({"status": "already running"}, status_code=429)
+    audit = Path(os.path.expanduser("~/.model-mesh/audit")) / "discovery.jsonl"
+    started = time.time()
     try:
         report = await asyncio.to_thread(
             discover,
@@ -162,6 +171,32 @@ async def mesh_probe():
             os.environ.get(CFG["provider"]["api_key_env"], ""),
             CFG["aliases"],
         )
+        _audit(audit, {"ts": started, "ok": True,
+                       "duration_s": round(time.time() - started, 1),
+                       **{k: report.get(k) for k in
+                          ("new", "eol", "returned", "probed")}})
         return report
+    except Exception as e:  # noqa: BLE001
+        _audit(audit, {"ts": started, "ok": False,
+                       "duration_s": round(time.time() - started, 1),
+                       "error": f"{type(e).__name__}: {e}"})
+        raise
     finally:
         _DISCOVERY_LOCK.release()
+
+
+def _audit(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+@app.get("/mesh/discovery")
+async def mesh_discovery(limit: int = 10):
+    """Last N discovery outcomes. This is how you check the daily job actually
+    ran and what it found — not by tailing a curl-owned log file."""
+    path = Path(os.path.expanduser("~/.model-mesh/audit")) / "discovery.jsonl"
+    if not path.is_file():
+        return {"runs": [], "note": "no discovery has been recorded yet"}
+    lines = path.read_text().strip().splitlines()[-limit:]
+    return {"runs": [json.loads(x) for x in lines]}

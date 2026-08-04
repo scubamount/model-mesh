@@ -26,6 +26,12 @@ from .index import Index, OK
 TRANSIENT_CODES = {429, 500, 502, 503, 504}
 AUTH_CODES = {401, 403}
 GONE_CODES = {404, 410}
+# Deterministic request rejection: the payload/params are wrong for THIS model,
+# so retrying it with the same body is guaranteed to fail again. Observed live
+# 2026-08-04: nemotron-super-49b returned http-400 on 4 of 7 retain calls (large
+# structured payload) while serving consolidation at 100%. Counted as a hard
+# failure for the op_class it was rejected on — never retried inside a cascade.
+REJECT_CODES = {400, 413, 422}
 
 
 @dataclass
@@ -37,6 +43,20 @@ class RouterConfig:
     reprobe_top_n: int = 3              # models re-probed on total miss
     request_timeout_s: float = 120.0
     probe_timeout_s: float = 30.0
+    # Sustained-failure floor. The consecutive-fail breaker cannot catch a model
+    # that alternates ok/fail: gpt-oss-20b timed out 6 of 8 retain calls
+    # (120s each) but never hit 3 in a row, so it stayed top-ranked and every
+    # retain paid 120s before cascading. Below this success rate (with at least
+    # min_samples in-window) a model is skipped for that op_class. Per-op_class
+    # because score() is per-op_class: nemotron-49b is 43% on retain (4x
+    # http-400 = deterministic payload rejection) but 100% on consolidation.
+    min_success_rate: float = 0.5
+    min_samples_for_floor: int = 4
+    # Whole-cascade budget. Must stay under the CLIENT's timeout or it gives up
+    # mid-cascade and the failover never completes: hindsight's retain timeout
+    # is 300s while 3 x 120s = 360s. Per-attempt timeout shrinks to fit what's
+    # left, so the cascade always gets to try every candidate.
+    total_budget_s: float = 240.0
 
 
 @dataclass
@@ -99,7 +119,7 @@ class Router:
 
     # -- breaker ------------------------------------------------------------
 
-    def _eligible(self, model_id: str) -> bool:
+    def _eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
         if b["state"] in ("gone", "auth"):
             return False
@@ -109,6 +129,15 @@ class Router:
                 self.index.breaker_set(model_id, state="recovering")
                 return True
             return False
+        # Sustained-failure floor: catches the intermittent model the
+        # consecutive-fail breaker structurally cannot (ok/fail alternating
+        # never reaches `breaker_threshold` in a row).
+        if op_class is not None:
+            s = self.index.score(model_id, op_class)
+            if (s is not None
+                    and s.n >= self.cfg.min_samples_for_floor
+                    and s.success_rate < self.cfg.min_success_rate):
+                return False
         return True  # healthy | recovering
 
     def _on_success(self, model_id: str) -> None:
@@ -173,6 +202,15 @@ class Router:
             self.index.breaker_set(model_id, state="auth")
             self.index.record(model_id, op_class, source, status, ms, payload_chars)
             return None, Attempt(model_id, status, ms, "auth: check API key")
+        if status_code in REJECT_CODES:
+            # Recorded (so the success-rate floor sees it and stops picking this
+            # model for this op_class) but NOT breaker-counted: the model is
+            # healthy, it just refuses this shape of request.
+            self.index.record(model_id, op_class, source, status, ms, payload_chars)
+            detail = str(payload.get("error", payload.get("detail", "")))[:200]
+            return None, Attempt(
+                model_id, status, ms, f"rejected (not retryable): {detail}"
+            )
         # transient (incl. 598 network / 599 malformed body)
         self.index.record(model_id, op_class, source, status, ms, payload_chars)
         self._on_transient_fail(model_id)
@@ -190,7 +228,7 @@ class Router:
         """
         scored, unknown = [], []
         for m in candidates:
-            if not self._eligible(m):
+            if not self._eligible(m, op_class):
                 continue
             s = self.index.score(m, op_class)
             (unknown if s is None else scored).append((m, s))
@@ -199,7 +237,10 @@ class Router:
 
     # -- probe (used by the re-probe arm and discovery) ----------------------
 
-    def probe(self, model_id: str, op_class: str, messages: list[dict]) -> bool:
+    def probe(
+        self, model_id: str, op_class: str, messages: list[dict],
+        timeout: Optional[float] = None,
+    ) -> bool:
         body = {
             "model": model_id,
             "messages": messages,
@@ -209,7 +250,7 @@ class Router:
         }
         payload, att = self._call(
             model_id, body, op_class, source="probe",
-            timeout=self.cfg.probe_timeout_s,
+            timeout=timeout or self.cfg.probe_timeout_s,
         )
         return payload is not None and att.status == OK
 
@@ -223,10 +264,26 @@ class Router:
         probe_messages: Optional[list[dict]] = None,
     ) -> RouteResult:
         result = RouteResult(ok=False)
+        deadline = time.monotonic() + self.cfg.total_budget_s
+
+        def _remaining() -> float:
+            return deadline - time.monotonic()
 
         order = self.ranked(candidates, op_class)
         for model_id in order[: self.cfg.max_attempts]:
-            payload, att = self._call(model_id, body, op_class, source="request")
+            left = _remaining()
+            if left <= 1.0:
+                result.attempts.append(
+                    Attempt(model_id, "skipped-budget", None,
+                            "cascade budget exhausted")
+                )
+                break
+            # Shrink the per-attempt timeout to what's left so the cascade never
+            # overruns the client's own timeout mid-failover.
+            payload, att = self._call(
+                model_id, body, op_class, source="request",
+                timeout=min(self.cfg.request_timeout_s, left),
+            )
             result.attempts.append(att)
             if payload is not None:
                 result.ok, result.model_id, result.response = True, model_id, payload
@@ -238,17 +295,24 @@ class Router:
         if probe_messages:
             fresh: list[str] = []
             for model_id in candidates:
-                if len(fresh) >= self.cfg.reprobe_top_n:
+                if len(fresh) >= self.cfg.reprobe_top_n or _remaining() <= 1.0:
                     break
                 b = self.index.breaker_get(model_id)
                 # gone/auth stay excluded, but 'down' models ARE re-probed here:
                 # this arm exists precisely because breaker state may be stale.
                 if b["state"] in ("gone", "auth"):
                     continue
-                if self.probe(model_id, op_class, probe_messages):
+                if self.probe(model_id, op_class, probe_messages,
+                              timeout=min(self.cfg.probe_timeout_s, _remaining())):
                     fresh.append(model_id)
             for model_id in fresh:
-                payload, att = self._call(model_id, body, op_class, source="request")
+                left = _remaining()
+                if left <= 1.0:
+                    break
+                payload, att = self._call(
+                    model_id, body, op_class, source="request",
+                    timeout=min(self.cfg.request_timeout_s, left),
+                )
                 result.attempts.append(att)
                 if payload is not None:
                     result.ok, result.model_id, result.response = (

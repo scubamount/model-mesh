@@ -48,7 +48,7 @@ cat > "$PLIST_DIR/$LABEL_DISCOVER.plist" <<EOF
   <key>Label</key><string>$LABEL_DISCOVER</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/curl</string>
-    <string>-s</string><string>-m</string><string>600</string>
+    <string>-s</string><string>-m</string><string>1800</string>
     <string>-X</string><string>POST</string>
     <string>http://127.0.0.1:8002/mesh/probe</string>
   </array>
