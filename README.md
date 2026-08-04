@@ -149,6 +149,11 @@ Drop-in for the nim-proxy contract hindsight already speaks:
 OpenAI-compatible localhost port. Cutover = change one port in
 `060-hindsight-setup.sh` (`:8001` → `:8002`), nothing else.
 
+`auto/evolve` serves DSPy skill evolution (hermes-agent-self-evolution) on its
+own `evolve` op_class. Separate op_class, not a reuse of `retain`: scores are
+per-op_class, so evolution traffic must not vote in the ranking that picks
+hindsight's memory models.
+
 ## Non-goals (v1)
 
 - Multi-provider fan-out (NIM only; the provider abstraction exists, the

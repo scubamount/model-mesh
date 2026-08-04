@@ -40,10 +40,31 @@ CONSOLIDATION_MESSAGES = [
     },
 ]
 
-PROMPTS = {"retain": RETAIN_MESSAGES, "consolidation": CONSOLIDATION_MESSAGES}
+EVOLVE_MESSAGES = [
+    {
+        "role": "system",
+        "content": (
+            "You follow the provided skill instructions to complete a task. "
+            "Respond with ONLY a JSON object of the form "
+            '{"facts": ["step1", "step2"]} listing the steps you would take. '
+            "No prose, no markdown."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "Skill: verify a daemon is healthy before routing traffic to it.\n"
+            "Task: the daemon on port 8002 just restarted — what do you do?"
+        ),
+    },
+]
+
+PROMPTS = {"retain": RETAIN_MESSAGES, "consolidation": CONSOLIDATION_MESSAGES,
+           "evolve": EVOLVE_MESSAGES}
 
 # Pad probes to the op-class's real payload size.
-PAD_CHARS = {"retain": 12000, "consolidation": 12000, "reflect": 12000}
+PAD_CHARS = {"retain": 12000, "consolidation": 12000, "reflect": 12000,
+             "evolve": 12000}
 
 _FILLER = (
     "The operator debugged the memory daemon; the embedder runs on the GPU and "

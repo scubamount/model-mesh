@@ -61,6 +61,17 @@ DEFAULTS: dict = {
                         "nano-vl", "reasoning"],
             "max_candidates": 8,
         },
+        # Long-form prose/instruction-following lane (DSPy skill evolution).
+        # Its OWN op_class on purpose: samples in `retain` drive hindsight's
+        # model choice, so evolution traffic must not vote in that ranking.
+        "auto/evolve": {
+            "op_class": "evolve",
+            "include": ["gpt-oss", "llama-3.3", "nemotron-super", "qwen3",
+                        "deepseek-v4"],
+            "exclude": ["vl-", "-vision", "safety-guard", "embed", "rerank",
+                        "nano-vl"],
+            "max_candidates": 8,
+        },
     },
 }
 
