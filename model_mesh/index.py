@@ -65,6 +65,14 @@ CONFIDENT_N = 8
 # above unknowns but below anything with a real track record.
 NEUTRAL_PRIOR = 50.0
 
+# How long a model retired with a request-time 404/410 stays retired before one
+# retry probe. NIM lists models before deploying them, so a 404 is often
+# temporary — but it is still LISTED, so un-retiring it on catalog presence
+# alone re-probes it every pass forever (measured: 17 of 18 EOL'd models were
+# still in the catalog). One week trades a stale exclusion for ~1 probe/model/
+# week instead of ~1/day.
+EOL_RECHECK_S = 7 * 86400.0
+
 
 @dataclass
 class Score:
@@ -100,9 +108,10 @@ class Index:
         new, eol, returned = [], [], []
         with self._lock:
             cur = self._conn.execute(
-                "SELECT id, eol_at FROM models WHERE provider = ?", (provider,)
+                "SELECT id, eol_at, eol_reason FROM models WHERE provider = ?",
+                (provider,),
             )
-            known = {r[0]: r[1] for r in cur.fetchall()}
+            known = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
             for mid in sorted(live_ids):
                 if mid not in known:
                     self._conn.execute(
@@ -115,7 +124,25 @@ class Index:
                     self._conn.execute(
                         "UPDATE models SET last_seen=? WHERE id=?", (now, mid)
                     )
-                    if known[mid] is not None:
+                    eol_at, eol_reason = known[mid]
+                    # Un-EOL a model retired for VANISHING from the catalog as
+                    # soon as it reappears. A model retired because it 404s is
+                    # still listed — the catalog advertises it, the provider
+                    # will not serve it — so clearing its EOL on sight
+                    # resurrects it every single pass: un-EOL -> re-probe ->
+                    # 404 -> EOL -> repeat, forever. Measured 2026-08-08: 17 of
+                    # 18 EOL'd models were still in the catalog, i.e. the whole
+                    # retirement set was being re-probed daily for nothing.
+                    #
+                    # But 404 must not be permanent either: NIM lists models
+                    # before deploying them, so today's 404 is often tomorrow's
+                    # working model. Retry one such model only after
+                    # EOL_RECHECK_S has elapsed, which costs a single probe per
+                    # model per week instead of per day.
+                    if eol_at is not None and (
+                        eol_reason == "catalog-drop"
+                        or (now - eol_at) >= EOL_RECHECK_S
+                    ):
                         self._conn.execute(
                             "UPDATE models SET eol_at=NULL, eol_reason=NULL"
                             " WHERE id=?",
@@ -124,7 +151,11 @@ class Index:
                         self._set_breaker_locked(mid, "healthy", 0, 0, 0)
                         returned.append(mid)
             for mid in set(known) - live_ids:
-                if known[mid] is None:
+                # known[mid] is now (eol_at, eol_reason); the drop test is on
+                # eol_at, not on the tuple. Comparing the tuple to None is
+                # always False, which would silently stop retiring models that
+                # genuinely vanished from the catalog.
+                if known[mid][0] is None:
                     self._conn.execute(
                         "UPDATE models SET eol_at=?, eol_reason='catalog-drop'"
                         " WHERE id=?",

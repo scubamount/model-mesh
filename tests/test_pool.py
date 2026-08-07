@@ -454,3 +454,74 @@ def test_shrinkage_is_never_a_subsidy(index):
         assert s.score <= full.score + 0.05, (
             f"{mid}: n=1 score {s.score} exceeds fully-evidenced {full.score}"
         )
+
+
+# -- EOL churn -----------------------------------------------------------------
+# 2026-08-08: 17 of 18 EOL'd models were STILL IN NIM's catalog. sync_catalog
+# cleared eol_at for any model present in the listing, so every pass ran
+# un-EOL -> re-probe -> 404 -> EOL -> repeat. The retirement set was being
+# re-probed daily, forever, for nothing — the exact CPU burn this design is
+# supposed to avoid.
+
+
+def test_404_model_still_listed_is_not_resurrected_every_pass(index):
+    """A model retired for 404 stays retired while it remains in the catalog."""
+    catalog = {"a/model", "b/model"}
+    index.sync_catalog("nim", catalog)
+    index.mark_gone("a/model", "http-404")
+    assert "a/model" not in index.live_models("nim")
+
+    # the model is STILL listed by the provider on the next pass
+    report = index.sync_catalog("nim", catalog)
+    assert "a/model" not in report["returned"], (
+        "404-retired model was resurrected while still listed — every pass "
+        "will re-probe it forever"
+    )
+    assert "a/model" not in index.live_models("nim")
+
+
+def test_catalog_drop_model_returns_immediately_when_relisted(index):
+    """The complement: a model that genuinely VANISHED must come straight back
+    when the provider re-lists it. Providers do un-deprecate."""
+    index.sync_catalog("nim", {"a/model", "b/model"})
+    index.sync_catalog("nim", {"b/model"})           # a/model vanishes
+    assert "a/model" not in index.live_models("nim")
+
+    report = index.sync_catalog("nim", {"a/model", "b/model"})  # relisted
+    assert "a/model" in report["returned"]
+    assert "a/model" in index.live_models("nim")
+
+
+def test_404_model_is_rechecked_after_the_recheck_window(index):
+    """404 must not be permanent — NIM lists models before deploying them, so
+    today's 404 is often tomorrow's working model."""
+    import time as _t
+    from model_mesh.index import EOL_RECHECK_S
+
+    catalog = {"a/model"}
+    index.sync_catalog("nim", catalog)
+    index.mark_gone("a/model", "http-404")
+
+    # backdate the retirement past the recheck window
+    with index._lock:
+        index._conn.execute(
+            "UPDATE models SET eol_at=? WHERE id=?",
+            (_t.time() - EOL_RECHECK_S - 60, "a/model"),
+        )
+        index._conn.commit()
+
+    report = index.sync_catalog("nim", catalog)
+    assert "a/model" in report["returned"], (
+        "404-retired model was never rechecked — a model NIM later deploys "
+        "can never come back"
+    )
+
+
+def test_vanished_model_is_still_retired(index):
+    """Guard the tuple refactor: known[mid] became (eol_at, eol_reason), and
+    `known[mid] is None` is always False on a tuple — which would silently stop
+    retiring models that genuinely left the catalog."""
+    index.sync_catalog("nim", {"a/model", "b/model"})
+    report = index.sync_catalog("nim", {"b/model"})
+    assert "a/model" in report["eol"], "a vanished model was not retired"
+    assert index.live_models("nim") == ["b/model"]
