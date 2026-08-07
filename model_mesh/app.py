@@ -72,8 +72,11 @@ async def chat_completions(request: Request):
         )
 
     op_class = alias.get("op_class", "retain")
-    pool = candidates_for(INDEX, CFG["provider"]["name"], alias,
-                          cap=alias.get("max_candidates"))
+    # Rank the FULL pool, then cap. candidates_for() no longer truncates: it
+    # returns rows in DB insertion order, so capping first would keep an
+    # arbitrary subset and could drop the best model outright.
+    pool = candidates_for(INDEX, CFG["provider"]["name"], alias)
+    pool = ROUTER.ranked(pool, op_class)[: alias.get("max_candidates") or None]
     result = await asyncio.to_thread(
         ROUTER.route, pool, body, op_class, probe_messages(op_class)
     )
@@ -177,6 +180,8 @@ async def mesh_probe():
             CFG["provider"]["base_url"],
             _api_key(),
             CFG["aliases"],
+            True,
+            (CFG.get("discovery") or {}).get("max_probes_per_pass"),
         )
         _audit(audit, {"ts": started, "ok": True,
                        "duration_s": round(time.time() - started, 1),

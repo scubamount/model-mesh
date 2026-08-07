@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS breaker (
 
 OK = "ok"
 
+# Samples required before a model's score is trusted at face value. Below this,
+# the score is shrunk toward NEUTRAL_PRIOR so a single fast probe cannot outrank
+# a model proven over dozens of real requests. 8 ~= two days of discovery probes
+# plus live traffic for an actually-used model.
+CONFIDENT_N = 8
+# Mid-scale prior: a barely-measured model sorts among mid-ranked proven models,
+# above unknowns but below anything with a real track record.
+NEUTRAL_PRIOR = 50.0
+
 
 @dataclass
 class Score:
@@ -214,10 +223,40 @@ class Index:
         lat_comp = max(0.0, 1.0 - (p95 / ceil_ms))
         jit_comp = max(0.0, 1.0 - min(jitter, 1.0))
         spk_comp = 1.0 - spike_rate
-        score = 100.0 * (
+        raw = 100.0 * (
             0.30 * lat_comp + 0.30 * jit_comp + 0.20 * spk_comp
             + 0.20 * success_rate
         )
+
+        # Confidence shrinkage. A single lucky probe is not evidence of
+        # reliability: on 2026-08-08 a widened pool put llama-3.1-8b (n=1,
+        # p95 0.4s, score 99.6) above gpt-oss-120b (n=20, p95 28.6s, score
+        # 56.5), which would have handed production retain traffic to a model
+        # measured exactly once. Jitter and spike-rate are also degenerate at
+        # n=1 (pstdev of one sample is 0, so the model scores a perfect
+        # consistency it has not demonstrated).
+        #
+        # Shrink toward a prior, then CAP the result at that prior while
+        # evidence is thin. Two earlier attempts were both wrong:
+        #
+        #   raw*c + 50.0*(1-c)          lifted an n=1 model to 56.2, above
+        #                               nemotron-super-49b (n=29, honest 51.8)
+        #   raw*c + min(50.0,raw)*(1-c) same outcome — capping the PRIOR does
+        #                               nothing when raw is huge (min(50,99)=50)
+        #
+        # An under-evidenced model must never outrank a well-evidenced one on
+        # the strength of a single fast sample, so below CONFIDENT_N its score
+        # is held at or under NEUTRAL_PRIOR. A proven model scoring above the
+        # prior therefore always wins; a proven model scoring below it has
+        # genuinely earned that position. Newcomers still sort above unknowns
+        # and converge to their true score as samples accumulate.
+        confidence = min(1.0, n / CONFIDENT_N)
+        if confidence < 1.0:
+            shrunk = raw * confidence + NEUTRAL_PRIOR * (1.0 - confidence)
+            score = min(shrunk, NEUTRAL_PRIOR)
+        else:
+            score = raw
+
         return Score(model_id, round(score, 1), p95, round(jitter, 3),
                      round(spike_rate, 3), round(success_rate, 3), n)
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .index import Index, OK
+from .opclass import check_fidelity
 
 logger = logging.getLogger("model_mesh.router")
 
@@ -300,6 +301,31 @@ class Router:
         self, model_id: str, op_class: str, messages: list[dict],
         timeout: Optional[float] = None,
     ) -> bool:
+        """Back-compat boolean probe. Prefer probe_verdict() — a bare bool
+        cannot distinguish "this model cannot do the job" from "this model was
+        busy just now"."""
+        return self.probe_verdict(model_id, op_class, messages, timeout)[0] == "pass"
+
+    def probe_verdict(
+        self, model_id: str, op_class: str, messages: list[dict],
+        timeout: Optional[float] = None,
+    ) -> tuple[str, str]:
+        """Probe once, returning (verdict, detail) instead of a bare bool.
+
+        Three outcomes that a boolean collapses into one, wrongly:
+
+          pass       served and obeyed the op_class contract.
+          unusable   PERMANENT: 404/410 (listed in the catalog but not actually
+                     servable) or a real fidelity failure (empty/non-JSON).
+          busy       TEMPORARY: 429/5xx/timeout. The model is overloaded right
+                     now, which says nothing about whether it can do the job.
+
+        Observed 2026-08-08: a backfill pass recorded 51 http-404 and 15
+        timeouts and reported all 66 as "failed fidelity". Zero were fidelity
+        failures. Treating a busy model as incapable permanently excludes
+        exactly the popular models we most want, so `busy` must be retried on a
+        later pass rather than held against the model.
+        """
         body = {
             "model": model_id,
             "messages": messages,
@@ -311,7 +337,14 @@ class Router:
             model_id, body, op_class, source="probe",
             timeout=timeout or self.cfg.probe_timeout_s,
         )
-        return payload is not None and att.status == OK
+        if payload is None or att.status != OK:
+            status = str(att.status or "")
+            if status in ("http-404", "http-410"):
+                return "unusable", f"not servable ({status})"
+            return "busy", f"{status}: {str(att.detail or '')[:120]}"
+
+        ok, why = check_fidelity(payload, op_class)
+        return ("pass", "") if ok else ("unusable", why)
 
     # -- the cascade ---------------------------------------------------------
 
