@@ -376,3 +376,31 @@ def test_resolve_api_key_falls_back_to_file(tmp_path, monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "env-key")
     assert resolve_api_key("NVIDIA_API_KEY", f) == "env-key"   # env wins
     assert resolve_api_key("MISSING_VAR", f) == ""
+
+
+def test_reject_is_logged_with_upstream_reason(index, caplog):
+    """A 4xx must surface the upstream's REASON, not just the status code.
+
+    2026-08-07: nemotron-super-49b returned http-400 on every retain while
+    succeeding on consolidation. mesh.db recorded the status but not the body,
+    so root-causing it (strict json_schema unsupported -> "Already borrowed")
+    required a standalone repro script. The router had no logger at all.
+    """
+    r, _ = make_router(index, {"m1": [(400, {"error": "Already borrowed"})]})
+    with caplog.at_level("WARNING", logger="model_mesh.router"):
+        r.route(["m1", "m2"], {"messages": [{"content": "hi"}]}, "retain")
+    rec = [x for x in caplog.records if "reject" in x.getMessage()]
+    assert rec, "a 4xx rejection produced no log line"
+    msg = rec[0].getMessage()
+    assert "Already borrowed" in msg, f"upstream reason not logged: {msg}"
+    assert "op_class=retain" in msg and "m1" in msg
+
+
+def test_transient_failure_is_logged(index, caplog):
+    """Same for 5xx/timeout: silent transients hid the wedge for hours."""
+    r, _ = make_router(index, {"m1": [(503, {"error": "overloaded"})]})
+    with caplog.at_level("WARNING", logger="model_mesh.router"):
+        r.route(["m1", "m2"], {"messages": [{"content": "hi"}]}, "retain")
+    rec = [x for x in caplog.records if "transient" in x.getMessage()]
+    assert rec, "a transient failure produced no log line"
+    assert "overloaded" in rec[0].getMessage()

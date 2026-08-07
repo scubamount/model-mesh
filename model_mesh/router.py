@@ -15,6 +15,7 @@ predecessor silently lost redundancy):
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .index import Index, OK
+
+logger = logging.getLogger("model_mesh.router")
 
 TRANSIENT_CODES = {429, 500, 502, 503, 504}
 AUTH_CODES = {401, 403}
@@ -252,6 +255,14 @@ class Router:
             # healthy, it just refuses this shape of request.
             self.index.record(model_id, op_class, source, status, ms, payload_chars)
             detail = str(payload.get("error", payload.get("detail", "")))[:200]
+            # Log it: a 4xx is a CAPABILITY signal, not noise. Diagnosing the
+            # 2026-08-07 nemotron rejections meant writing a repro script purely
+            # because this body was recorded to mesh.db but never surfaced —
+            # sqlite stores the status code, not the upstream's reason.
+            logger.warning(
+                "reject model=%s op_class=%s status=%s payload_chars=%d detail=%s",
+                model_id, op_class, status, payload_chars, detail or "(empty)",
+            )
             return None, Attempt(
                 model_id, status, ms, f"rejected (not retryable): {detail}"
             )
@@ -259,6 +270,10 @@ class Router:
         self.index.record(model_id, op_class, source, status, ms, payload_chars)
         self._on_transient_fail(model_id)
         detail = str(payload.get("error", payload.get("detail", "")))[:200]
+        logger.warning(
+            "transient model=%s op_class=%s status=%s ms=%.0f detail=%s",
+            model_id, op_class, status, ms, detail or "(empty)",
+        )
         return None, Attempt(model_id, status, ms, detail)
 
     # -- ranking ------------------------------------------------------------
