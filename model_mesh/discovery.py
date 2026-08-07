@@ -93,6 +93,7 @@ def discover(
     probed: dict[str, dict[str, str]] = {}
     unusable: list[str] = []
     deferred: list[str] = []
+    rejected: list[str] = []
     if probe_new:
         # Probe models with NO evidence for an op_class — not merely the ones
         # that are new in this pass. `report["new"]` is empty for everything
@@ -138,10 +139,20 @@ def discover(
                 # popular model is never excluded for being popular.
                 if verdict == "busy":
                     deferred.append(mid)
+                # `rejected` = 400/413/422: the provider parsed the request and
+                # refused it, so this op_class is settled until the evidence
+                # goes stale. _call already recorded the sample, so scoring and
+                # Router._eligible (via unrebutted_reject) both see it and no
+                # further pass re-probes this pair. Keep probing the model's
+                # OTHER op_classes: a reject is per-request-shape, not a
+                # property of the model.
+                if verdict == "rejected":
+                    rejected.append(mid)
             budget -= 1
     report["probed"] = probed
     report["unusable"] = unusable
     report["deferred_busy"] = deferred
+    report["rejected"] = rejected
     return report
 
 

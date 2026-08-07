@@ -65,6 +65,18 @@ CONFIDENT_N = 8
 # above unknowns but below anything with a real track record.
 NEUTRAL_PRIOR = 50.0
 
+# Statuses that mean "the provider understood the request and refused it" — a
+# deterministic capability verdict, not a transient failure. Recorded by
+# Router._call as http-<code>. Router derives its own copy from REJECT_CODES
+# and a test asserts the two agree, because router imports index (not the
+# reverse) and duplicating the set silently is how these drift.
+REJECT_STATUSES = ("http-400", "http-413", "http-422")
+
+# How long an unrebutted capability rejection excludes a model from an op_class
+# before one retry is admitted. Mirrors EOL_RECHECK_S: a reject is strong
+# evidence but never permanent, because NIM changes what it serves.
+REJECT_RECHECK_S = 7 * 86400.0
+
 # How long a model retired with a request-time 404/410 stays retired before one
 # retry probe. NIM lists models before deploying them, so a 404 is often
 # temporary — but it is still LISTED, so un-retiring it on catalog presence
@@ -214,6 +226,45 @@ class Index:
                 (model_id, op_class),
             ).fetchone()
         return row[0] or 0.0
+
+    def unrebutted_reject(
+        self, model_id: str, op_class: str, recheck_s: float = REJECT_RECHECK_S
+    ) -> Optional[float]:
+        """Timestamp of a capability rejection that no later success rebuts.
+
+        A 400/413/422 means the provider parsed the request and refused it: the
+        model cannot do this op_class in this shape, and retrying is guaranteed
+        to fail the same way. Observed 2026-08-08 —
+        nvidia/nemotron-mini-4b-instruct has a 4096-token context and every
+        op_class asks for 4096 completion tokens, so it returned http-400
+        ("maximum context length is 4096 tokens... you requested 6508") on all
+        three probes and can never succeed.
+
+        The success-rate floor structurally cannot catch this. It needs
+        min_samples_for_floor (4) samples before it engages, but a model that
+        deterministically rejects never accrues a 4th sample from real traffic
+        — one attempt per cascade, and nothing about failing makes it get
+        sampled again. So it sat at n=1, success_rate=0.0, eligible=True,
+        wasting a cascade slot on every single memory operation, forever.
+
+        Returns None when the model's most recent evidence for this op_class is
+        not a reject (any later success rebuts it), or when the reject is older
+        than recheck_s — NIM changes what it serves, so this is never permanent.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, ts FROM samples WHERE model_id=? AND op_class=?"
+                " ORDER BY ts DESC LIMIT 1",
+                (model_id, op_class),
+            ).fetchone()
+        if not row:
+            return None
+        status, ts = row
+        if status not in REJECT_STATUSES:
+            return None
+        if (time.time() - ts) >= recheck_s:
+            return None  # stale: admit one retry
+        return ts
 
     # -- scoring ------------------------------------------------------------
 

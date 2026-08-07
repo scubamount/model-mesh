@@ -525,3 +525,121 @@ def test_vanished_model_is_still_retired(index):
     report = index.sync_catalog("nim", {"b/model"})
     assert "a/model" in report["eol"], "a vanished model was not retired"
     assert index.live_models("nim") == ["b/model"]
+
+
+# -- deterministic capability rejection ---------------------------------------
+# 2026-08-08: nvidia/nemotron-mini-4b-instruct has a 4096-token context window
+# and every op_class asks for max_tokens=4096, so NIM returned http-400 ("maximum
+# context length is 4096 tokens. However, you requested 6508") on all three
+# probes. It can never succeed, yet it sat at n=1, success_rate=0.0,
+# eligible=True — burning a cascade slot on every memory operation.
+#
+# The success-rate floor structurally cannot catch this: it engages only at
+# min_samples_for_floor (4) samples, and a deterministically-rejecting model
+# never earns a 4th sample. One attempt per cascade, and failing does not cause
+# resampling. A floor that needs evidence can't police a model that never
+# accrues any.
+
+
+def test_reject_is_its_own_verdict_not_busy(index):
+    """400 is a capability answer, not overload. Classifying it `busy` meant
+    re-probing a model whose answer cannot change."""
+    r = _router_returning(index, "http-400", None, "maximum context length")
+    verdict, detail = r.probe_verdict("nvidia/nemotron-mini-4b-instruct", "retain", [])
+    assert verdict == "rejected", f"400 classified as {verdict!r}"
+    assert "http-400" in detail
+
+
+@pytest.mark.parametrize("status", ["http-400", "http-413", "http-422"])
+def test_all_reject_codes_are_rejected_verdicts(index, status):
+    r = _router_returning(index, status, None, "refused")
+    verdict, _ = r.probe_verdict("some/model", "retain", [])
+    assert verdict == "rejected", f"{status} classified as {verdict!r}"
+
+
+def test_reject_status_sets_agree_across_modules():
+    """index.REJECT_STATUSES and router.REJECT_STATUS_NAMES are the same set
+    expressed twice (router imports index, not the reverse). Silently drifting
+    apart would leave a code rejected by one layer and admitted by the other."""
+    from model_mesh.index import REJECT_STATUSES
+    from model_mesh.router import REJECT_CODES, REJECT_STATUS_NAMES
+
+    assert set(REJECT_STATUSES) == REJECT_STATUS_NAMES
+    assert REJECT_STATUS_NAMES == {f"http-{c}" for c in REJECT_CODES}
+
+
+def test_deterministically_rejecting_model_is_ineligible(index):
+    """The live bug, at the layer all real traffic routes through."""
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "nvidia/nemotron-mini-4b-instruct"
+    index.record(mid, "retain", "probe", "http-400", 267.0, 11653)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+
+    s = index.score(mid, "retain")
+    assert s.n < RouterConfig().min_samples_for_floor, (
+        "precondition: this bug exists BECAUSE n stays under the floor "
+        f"(n={s.n}); if the floor could see it, no new gate would be needed")
+    assert not r._eligible(mid, "retain"), (
+        "a model that deterministically rejects retain must not stay eligible")
+
+
+def test_reject_is_scoped_to_the_op_class(index):
+    """A reject is about the request shape, not the model. nemotron-super-49b
+    rejects retain (11.5k-12.6k char payloads) while serving consolidation at
+    100% — excluding it wholesale would lose the consolidation winner."""
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "nvidia/llama-3.3-nemotron-super-49b-v1"
+    index.record(mid, "retain", "request", "http-400", 300.0, 12618)
+    index.record(mid, "consolidation", "request", "ok", 35_000.0, 12000)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+
+    assert not r._eligible(mid, "retain")
+    assert r._eligible(mid, "consolidation"), (
+        "a reject on one op_class must not exclude the model from another")
+
+
+def test_a_later_success_rebuts_the_reject(index):
+    """Never permanent: if the model later serves the op_class, the reject is
+    stale evidence and must stop gating."""
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "some/model"
+    index.record(mid, "retain", "probe", "http-400", 250.0, 12000)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    assert not r._eligible(mid, "retain")
+
+    index.record(mid, "retain", "request", "ok", 9_000.0, 12000)
+    assert r._eligible(mid, "retain"), "a later success must rebut the reject"
+
+
+def test_reject_goes_stale_and_admits_a_retry(index):
+    """NIM changes what it serves. An old reject must not exclude forever."""
+    import time as _t
+
+    from model_mesh.index import REJECT_RECHECK_S
+
+    mid = "some/model"
+    index.record(mid, "retain", "probe", "http-400", 250.0, 12000)
+    with index._lock:
+        index._conn.execute(
+            "UPDATE samples SET ts=? WHERE model_id=?",
+            (_t.time() - REJECT_RECHECK_S - 60, mid),
+        )
+        index._conn.commit()
+
+    assert index.unrebutted_reject(mid, "retain") is None, (
+        "a reject older than REJECT_RECHECK_S must go stale")
+
+
+def test_transient_failure_is_not_treated_as_a_reject(index):
+    """The inverse error: excluding a model for being overloaded is exactly the
+    bug this whole verdict split exists to prevent."""
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "openai/gpt-oss-120b"
+    index.record(mid, "retain", "request", "http-503", 900.0, 12000)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    assert index.unrebutted_reject(mid, "retain") is None
+    assert r._eligible(mid, "retain"), "503 is overload, not a capability verdict"

@@ -36,6 +36,8 @@ GONE_CODES = {404, 410}
 # structured payload) while serving consolidation at 100%. Counted as a hard
 # failure for the op_class it was rejected on — never retried inside a cascade.
 REJECT_CODES = {400, 413, 422}
+# Same set as status strings, derived so the two can never drift apart.
+REJECT_STATUS_NAMES = {f"http-{c}" for c in REJECT_CODES}
 
 
 @dataclass
@@ -166,6 +168,17 @@ class Router:
         # consecutive-fail breaker structurally cannot (ok/fail alternating
         # never reaches `breaker_threshold` in a row).
         if op_class is not None:
+            # Capability rejection floor. A 400/413/422 is the provider saying
+            # it parsed the request and refuses it, so every retry fails
+            # identically. The success-rate floor below cannot catch this: it
+            # only engages at min_samples_for_floor samples, and a model that
+            # deterministically rejects never earns a 4th sample (one attempt
+            # per cascade, and failing does not cause resampling). Observed
+            # 2026-08-08 — nemotron-mini-4b-instruct (4096-token context, and
+            # we ask for 4096 completion tokens) sat at n=1, success_rate=0.0,
+            # eligible=True and burned a cascade slot on every memory op.
+            if self.index.unrebutted_reject(model_id, op_class) is not None:
+                return False
             s = self.index.score(model_id, op_class)
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
@@ -341,6 +354,17 @@ class Router:
             status = str(att.status or "")
             if status in ("http-404", "http-410"):
                 return "unusable", f"not servable ({status})"
+            # A 4xx reject is a CAPABILITY verdict, not overload: the provider
+            # parsed the request and refused it, so re-probing produces the
+            # identical answer. Calling it `busy` (the pre-2026-08-08 behaviour)
+            # meant a model that can never serve this op_class was re-probed on
+            # every pass and stayed eligible for real traffic. It is recorded
+            # per-op_class by _call, so `unrebutted_reject` gates it — but it is
+            # NOT mark_gone: the model may serve other op_classes perfectly
+            # (nemotron-mini-4b only fails because 4096 completion tokens
+            # exceeds its whole context, which is a per-request-shape fact).
+            if status in REJECT_STATUS_NAMES:
+                return "rejected", f"{status}: {str(att.detail or '')[:120]}"
             return "busy", f"{status}: {str(att.detail or '')[:120]}"
 
         ok, why = check_fidelity(payload, op_class)
