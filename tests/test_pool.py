@@ -643,3 +643,116 @@ def test_transient_failure_is_not_treated_as_a_reject(index):
     r = Router(index, "https://x/v1", "k", RouterConfig())
     assert index.unrebutted_reject(mid, "retain") is None
     assert r._eligible(mid, "retain"), "503 is overload, not a capability verdict"
+
+
+# -- proven models keep their cascade slot -------------------------------------
+# 2026-08-08: the confidence cap was one-sided. It pinned thin evidence AT
+# NEUTRAL_PRIOR but let a proven model score BELOW it, so unknowns outranked
+# proof. nvidia/llama-3.3-nemotron-super-49b-v1 — 36/36 consolidation successes,
+# 100%, actively serving — scored 49.2 (p95 74.7s is legitimately slow) and fell
+# to rank 13 behind eleven n=1 models sitting at exactly 50.0. max_candidates=8
+# then evicted it from the cascade: the one model PROVEN to do the job could no
+# longer be chosen for it.
+
+
+def _seed_live_consolidation_regime(index, mid):
+    """Replay the ACTUAL measured latencies, not an invented distribution.
+
+    These are the 36 real consolidation samples from
+    nvidia/llama-3.3-nemotron-super-49b-v1 on 2026-08-08 (median 31.4s, p95
+    74.7s, jitter 0.694), which score 49.2 raw — just BELOW NEUTRAL_PRIOR.
+    That sub-prior position is the entire bug: it is what let eleven n=1
+    models pinned at 50.0 outrank a model with 36/36 successes.
+
+    Two earlier synthetic fixtures were vacuous and both passed with the bug
+    reinstated. One drew a tail to 80s (p95 77.8s), over the 75s eligibility
+    floor, so the model was dropped before ranking ran. The next scored 55.3 —
+    ABOVE the prior — so max(raw, NEUTRAL_PRIOR) was a no-op and removing the
+    floor changed nothing. Guessing at a distribution kept missing the narrow
+    regime where the bug lives; replaying the measurement cannot.
+    """
+    for seconds in [
+        2.6, 5.4, 6.1, 8.3, 11.2, 12.4, 13.1, 15.0, 15.4, 16.2, 16.8, 18.3,
+        21.4, 25.1, 26.3, 27.2, 28.4, 29.1, 34.0, 34.6, 36.2, 38.1, 40.3,
+        41.2, 42.4, 43.1, 47.2, 50.3, 53.1, 54.2, 55.4, 56.1, 66.3, 74.7,
+        83.2, 88.4,
+    ]:
+        index.record(mid, "consolidation", "request", "ok", seconds * 1000.0, 12_000)
+
+
+def test_proven_model_is_not_evicted_by_unproven_ones(index):
+    """The live regression, end to end through ranking and the candidate cap."""
+    from model_mesh.index import NEUTRAL_PRIOR
+    from model_mesh.router import Router, RouterConfig
+
+    proven = "nvidia/llama-3.3-nemotron-super-49b-v1"
+    _seed_live_consolidation_regime(index, proven)
+
+    s = index.score(proven, "consolidation")
+    assert s.success_rate == 1.0 and s.n == 36
+    assert s.p95_ms < RouterConfig().max_p95_ms_for_eligibility, (
+        f"precondition: p95={s.p95_ms:.0f}ms must stay under the latency floor, "
+        f"or _eligible() drops the model before ranking runs and the test "
+        f"fails for the wrong reason")
+
+    # The precondition that makes this bug possible AT ALL: the proven model's
+    # honest score is BELOW the prior that unproven models are pinned to. If a
+    # fixture scores above the prior, the floor is a no-op and this test passes
+    # with the bug fully reinstated (measured: a 55.3-scoring fixture did).
+    raw_below_prior = (
+        0.30 * max(0.0, 1.0 - (s.p95_ms / 30_000.0))
+        + 0.30 * max(0.0, 1.0 - min(s.jitter, 1.0))
+        + 0.20 * (1.0 - s.spike_rate)
+        + 0.20 * s.success_rate
+    ) * 100.0
+    assert raw_below_prior < NEUTRAL_PRIOR, (
+        f"precondition: the proven model's raw score ({raw_below_prior:.1f}) must "
+        f"be below NEUTRAL_PRIOR ({NEUTRAL_PRIOR}) — that is what lets unproven "
+        f"models outrank it; above the prior, the floor cannot be exercised")
+
+    # Eleven single-probe newcomers, each fast enough to score ~99 raw.
+    newcomers = [f"vendor/newcomer-{i:02d}" for i in range(11)]
+    for m in newcomers:
+        index.record(m, "consolidation", "probe", "ok", 500.0, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    ranked = r.ranked([proven] + newcomers, "consolidation")
+
+    assert ranked[0] == proven, (
+        f"36/36 proven model must outrank single-probe newcomers; "
+        f"got {ranked[:3]}")
+    assert proven in ranked[:8], (
+        "with max_candidates=8 the proven model must stay in the cascade")
+
+
+def test_thin_evidence_still_cannot_outrank_a_better_proven_model(index):
+    """The original guarantee must survive the fix: a lucky fast probe does not
+    beat a model with a real track record."""
+    from model_mesh.router import Router, RouterConfig
+
+    import random
+    rnd = random.Random(5)
+    for _ in range(20):
+        index.record("openai/gpt-oss-120b", "retain", "request", "ok",
+                     rnd.uniform(15_000, 30_000), 12_000)
+    index.record("meta/llama-3.1-8b-instruct", "retain", "probe", "ok", 400.0, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    ranked = r.ranked(["meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b"], "retain")
+    assert ranked[0] == "openai/gpt-oss-120b", (
+        "an n=1 probe must not outrank a 20-sample proven model")
+
+
+def test_thin_evidence_sorts_below_a_proven_model_at_the_prior(index):
+    """The margin exists so the two cannot tie at exactly 50.0, where ordering
+    would fall to arbitrary insertion order."""
+    from model_mesh.index import NEUTRAL_PRIOR
+
+    proven = "proven/slow-but-reliable"
+    _seed_live_consolidation_regime(index, proven)
+    index.record("vendor/newcomer", "consolidation", "probe", "ok", 500.0, 12_000)
+
+    ps = index.score(proven, "consolidation").score
+    ns = index.score("vendor/newcomer", "consolidation").score
+    assert ns < ps, f"thin evidence {ns} must sort below proven {ps}"
+    assert ps >= NEUTRAL_PRIOR, "a confident model is floored at the prior"

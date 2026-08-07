@@ -65,6 +65,12 @@ CONFIDENT_N = 8
 # above unknowns but below anything with a real track record.
 NEUTRAL_PRIOR = 50.0
 
+# Thin evidence sorts just BELOW the prior so that a proven model scoring at
+# the prior still outranks it. Without this margin the two tie at 50.0 and
+# ordering falls to dict insertion order, which is alphabetical by model id —
+# i.e. arbitrary. Small enough that newcomers still sort well above unknowns.
+THIN_EVIDENCE_MARGIN = 0.1
+
 # Statuses that mean "the provider understood the request and refused it" — a
 # deterministic capability verdict, not a transient failure. Recorded by
 # Router._call as http-<code>. Router derives its own copy from REJECT_CODES
@@ -328,16 +334,31 @@ class Index:
         #
         # An under-evidenced model must never outrank a well-evidenced one on
         # the strength of a single fast sample, so below CONFIDENT_N its score
-        # is held at or under NEUTRAL_PRIOR. A proven model scoring above the
-        # prior therefore always wins; a proven model scoring below it has
-        # genuinely earned that position. Newcomers still sort above unknowns
-        # and converge to their true score as samples accumulate.
+        # is held at or under NEUTRAL_PRIOR. Newcomers still sort above
+        # unknowns and converge to their true score as samples accumulate.
+        #
+        # The cap alone is one-sided, and that asymmetry is a bug (observed
+        # 2026-08-08): it pins thin evidence AT the prior but lets a proven
+        # model score BELOW it, so unknowns outrank proof. nemotron-super-49b-v1
+        # — 36/36 consolidation successes, 100%, actively serving — scored 49.2
+        # (p95 74.7s is legitimately slow) and fell to rank 13, behind eleven
+        # n=1 models pinned at exactly 50.0. With max_candidates=8 it was
+        # evicted from the cascade entirely: the one model PROVEN to do the job
+        # could no longer be chosen for it.
+        #
+        # So a tie against thin evidence must break toward the proven model.
+        # Ranking sorts by score alone, so the tiebreak has to live in the
+        # score: hold thin evidence just BELOW the prior (not at it) and floor
+        # a confident model at the prior. Both bounds are needed — dropping
+        # either one restores the eviction.
         confidence = min(1.0, n / CONFIDENT_N)
         if confidence < 1.0:
             shrunk = raw * confidence + NEUTRAL_PRIOR * (1.0 - confidence)
-            score = min(shrunk, NEUTRAL_PRIOR)
+            score = min(shrunk, NEUTRAL_PRIOR - THIN_EVIDENCE_MARGIN)
         else:
-            score = raw
+            # A model with CONFIDENT_N samples of real evidence ranks on its
+            # merits, but never loses its cascade slot to an unproven model.
+            score = max(raw, NEUTRAL_PRIOR)
 
         return Score(model_id, round(score, 1), p95, round(jitter, 3),
                      round(spike_rate, 3), round(success_rate, 3), n)
