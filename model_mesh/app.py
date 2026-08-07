@@ -143,12 +143,25 @@ async def mesh_status():
         oc = cfg.get("op_class", "retain")
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
         ranked = ROUTER.ranked(pool, oc)
+        # Score EVERY model that has evidence, not just the visible top 10.
+        # A truncated view is how the 2026-08-08 eviction hid: a model with
+        # 36/36 successes fell to rank 13 and simply vanished off the end of
+        # this response, so neither /mesh/status nor any check reading it could
+        # see that the proven model had lost its cascade slot. Reporting is
+        # cheap; a blind spot exactly the width of the bug is not.
         scores = {}
-        for m in ranked[:10]:
+        for m in ranked:
             s = INDEX.score(m, oc)
-            scores[m] = vars(s) if s else None
+            if s is not None:
+                scores[m] = vars(s)
         out["aliases"][alias] = {
-            "op_class": oc, "pool_size": len(pool), "ranking": ranked[:10],
+            "op_class": oc,
+            "pool_size": len(pool),
+            "ranking": ranked[:10],
+            # Full ordering, so a consumer can tell "ranked 13th" from
+            # "not ranked at all" — those have very different causes.
+            "ranking_all": ranked,
+            "max_candidates": cfg.get("max_candidates"),
             "scores": scores,
         }
     return out
