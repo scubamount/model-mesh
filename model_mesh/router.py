@@ -59,6 +59,15 @@ class RouterConfig:
     # http-400 = deterministic payload rejection) but 100% on consolidation.
     min_success_rate: float = 0.5
     min_samples_for_floor: int = 4
+    # Latency floor, sibling of min_success_rate. A model can pass the success
+    # floor and still be unusable: llama-3.3-70b sat at 61% success with p95
+    # 96.9s and stayed ranked #2 on retain, so two attempts exhausted the 240s
+    # budget and the op wedged until the watchdog reset it (2026-08-07).
+    # Default 75s: an attempt must be able to run twice inside total_budget_s
+    # (2 x 75 = 150 < 240) so the cascade always has a real second try left.
+    # Raise it only if total_budget_s rises too — audit-timeout-chain.py checks
+    # the relationship.
+    max_p95_ms_for_eligibility: float = 75_000.0
     # Whole-cascade budget. Must stay under the CLIENT's timeout or it gives up
     # mid-cascade and the failover never completes: hindsight's retain timeout
     # is 300s while 3 x 120s = 360s. Per-attempt timeout shrinks to fit what's
@@ -157,6 +166,17 @@ class Router:
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
                     and s.success_rate < self.cfg.min_success_rate):
+                return False
+            # Latency floor. Success rate alone is not enough: a model can sit
+            # above the success floor and still be unusable because a single
+            # attempt eats the whole cascade budget. Observed 2026-08-07 —
+            # llama-3.3-70b at 61% success (above the 0.5 floor) with p95 96.9s
+            # stayed ranked #2 on retain, so two attempts blew total_budget_s=240
+            # and the op wedged until the watchdog reset it.
+            # Ranking already knew (score 51.9 vs 66.4); eligibility did not.
+            if (s is not None
+                    and s.n >= self.cfg.min_samples_for_floor
+                    and s.p95_ms > self.cfg.max_p95_ms_for_eligibility):
                 return False
         return True  # healthy | recovering
 

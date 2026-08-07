@@ -234,6 +234,50 @@ def test_floor_needs_min_samples(index):
     assert router.ranked(["new"], "retain") == ["new"]
 
 
+# --- latency floor -----------------------------------------------------------
+
+def test_latency_floor_excludes_a_model_that_eats_the_cascade_budget(index):
+    """Success rate alone is not enough. Live 2026-08-07: llama-3.3-70b sat at
+    61% success (ABOVE the 0.5 floor) with p95 96.9s and stayed ranked #2 on
+    retain, so two attempts blew total_budget_s=240 and the op wedged in
+    'processing' until the watchdog reset it. Ranking already knew it was bad
+    (score 51.9 vs 66.4); eligibility did not look at latency at all."""
+    for i in range(10):                     # 70% success, all of them slow
+        index.record("slow", "retain", "request",
+                     OK if i % 10 < 7 else "timeout", 96_900.0)
+    index.record("fast", "retain", "request", OK, 5_000.0)
+    router, t = make_router(index)
+    s = index.score("slow", "retain")
+    assert s.success_rate > 0.5             # passes the success floor
+    assert router.ranked(["slow", "fast"], "retain") == ["fast"]
+
+
+def test_latency_floor_respects_min_samples(index):
+    """A single slow sample must not exile a model, same rule as the success
+    floor — cold starts and one-off spikes are not a verdict."""
+    index.record("cold", "retain", "request", OK, 300_000.0)
+    router, t = make_router(index)
+    assert router.ranked(["cold"], "retain") == ["cold"]
+
+
+def test_latency_floor_is_per_op_class(index):
+    """Consolidation legitimately runs longer than retain. A model that is slow
+    on one op_class must stay eligible for the other, like the success floor."""
+    for _ in range(6):
+        index.record("m", "retain", "request", OK, 96_900.0)     # too slow
+        index.record("m", "consolidation", "request", OK, 40_000.0)  # fine
+    router, t = make_router(index)
+    assert router.ranked(["m"], "retain") == []
+    assert router.ranked(["m"], "consolidation") == ["m"]
+
+
+def test_latency_floor_leaves_room_for_a_second_attempt(index):
+    """The default must let an attempt run TWICE inside the cascade budget,
+    otherwise one slow candidate still consumes the whole failover."""
+    cfg = RouterConfig()
+    assert 2 * (cfg.max_p95_ms_for_eligibility / 1000.0) < cfg.total_budget_s
+
+
 def test_http_400_not_retried_and_not_breaker_counted(index):
     router, t = make_router(index, {"m1": [(400, {"detail": "bad payload"})]})
     res = router.route(["m1", "m2"], {"messages": []}, "retain")
