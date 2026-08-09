@@ -75,7 +75,14 @@ DEFAULTS: dict = {
     # explosion can't turn the daily job into an unbounded burn. Steady state is
     # ~0 probes: a model is probed once per op_class, then real traffic keeps it
     # scored for free.
-    "discovery": {"max_probes_per_pass": 25},
+    #
+    # probe_top_n bounds it by RELEVANCE rather than by count: only the best few
+    # candidates per alias are probed at all. The cascade tries at most 3 models,
+    # so knowing the health of the 20th-best is worth nothing and costs a real
+    # request against a shared free endpoint. 6 leaves double the cascade depth
+    # in reserve, so several top models can be overloaded at once and a healthy,
+    # freshly-measured alternative is still ready.
+    "discovery": {"max_probes_per_pass": 25, "probe_top_n": 6},
     # Non-text modalities and non-generative heads. EXCLUSION-first on purpose:
     # an include-whitelist of families matched 5 of 102 live NIM models and
     # silently shrank as NIM's catalog grew (see discovery.eligible_for_alias).

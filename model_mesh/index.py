@@ -242,6 +242,46 @@ class Index:
             ).fetchone()
         return row[0] or 0.0
 
+    def dormant_since(
+        self, model_id: str, dormant_after_s: float
+    ) -> Optional[float]:
+        """Timestamp of the last success, when a model has failed ever since.
+
+        Returns None if the model succeeded within `dormant_after_s`, or has no
+        samples at all (never tried is not dormant — it is unknown, and unknown
+        is exactly what discovery exists to resolve).
+
+        NIM lists models it will not actually serve: measured 2026-08-09, 17 of
+        18 models the index had EOL'd on request-time 404s were still present in
+        the catalog. Catalog presence therefore cannot answer "is this model
+        real", and without a dormancy test every one of those is re-probed on
+        every pass forever — burning the probe budget that newly-released models
+        need, on models that have not served a request in weeks.
+
+        Deliberately reads the sample log rather than a flag: a model that
+        starts working again rebuts its own dormancy the moment one success
+        lands, with no separate resurrection path to maintain, and no state that
+        can disagree with the evidence.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(CASE WHEN status=? THEN ts END), MAX(ts)"
+                " FROM samples WHERE model_id=?",
+                (OK, model_id),
+            ).fetchone()
+        if not row or row[1] is None:
+            return None  # never sampled: unknown, not dormant
+        last_ok, last_any = row
+        now = time.time()
+        if last_ok is None:
+            # Never once succeeded. Dormant only after the window has elapsed
+            # since we started trying, so a model discovered minutes ago is not
+            # written off before it has had a fair chance.
+            return last_any if (now - last_any) >= dormant_after_s else None
+        if (now - last_ok) >= dormant_after_s:
+            return last_ok
+        return None
+
     def unrebutted_reject(
         self, model_id: str, op_class: str, recheck_s: float = REJECT_RECHECK_S
     ) -> Optional[float]:

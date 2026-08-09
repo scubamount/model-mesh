@@ -25,7 +25,22 @@ from .config import load_config, resolve_api_key
 from .discovery import candidates_for, discover, fetch_catalog
 from .index import Index
 from .opclass import probe_messages
+from .quality import (
+    BUCKET_FAILING,
+    BUCKET_HEALTHY,
+    BUCKET_OVERLOADED,
+    BUCKET_UNKNOWN,
+    availability_bucket,
+)
+from .quality import tier as quality_tier
 from .router import Router, RouterConfig
+
+_BUCKET_NAMES = {
+    BUCKET_HEALTHY: "healthy",
+    BUCKET_OVERLOADED: "overloaded",
+    BUCKET_UNKNOWN: "unknown",
+    BUCKET_FAILING: "failing",
+}
 
 CFG = load_config()
 INDEX = Index(CFG["db_path"])
@@ -43,6 +58,12 @@ ROUTER = Router(
     RouterConfig(**CFG.get("router", {})),
 )
 _DISCOVERY_LOCK = threading.Lock()
+# Read off the ROUTER's own config rather than re-reading CFG: /mesh/status must
+# report the values that actually rank requests. Two independent reads of the
+# same config is how a status page starts describing a system that no longer
+# exists.
+_TIER_OVERRIDES = ROUTER.cfg.tier_overrides
+_OVERLOAD_P95_MS = ROUTER.cfg.overload_p95_ms
 
 app = FastAPI(title="model-mesh")
 
@@ -154,6 +175,21 @@ async def mesh_status():
             s = INDEX.score(m, oc)
             if s is not None:
                 scores[m] = vars(s)
+        # The two ranking inputs, reported for EVERY ranked model. Ordering is
+        # (bucket, tier, latency), so without these a reader can see the order
+        # but not the reason for it — and the previous ranking failed silently
+        # in exactly that way: every score collapsed to ~50.0, the visible
+        # ordering became alphabetical, and nothing in this response said so.
+        # Anything that decides routing has to be inspectable here.
+        rank_inputs = {
+            m: {
+                "tier": quality_tier(m, _TIER_OVERRIDES),
+                "bucket": _BUCKET_NAMES[
+                    availability_bucket(INDEX.score(m, oc), _OVERLOAD_P95_MS)
+                ],
+            }
+            for m in ranked
+        }
         out["aliases"][alias] = {
             "op_class": oc,
             "pool_size": len(pool),
@@ -163,6 +199,7 @@ async def mesh_status():
             "ranking_all": ranked,
             "max_candidates": cfg.get("max_candidates"),
             "scores": scores,
+            "rank_inputs": rank_inputs,
         }
     return out
 
@@ -187,14 +224,20 @@ async def mesh_probe():
     audit = Path(os.path.expanduser("~/.model-mesh/audit")) / "discovery.jsonl"
     started = time.time()
     try:
+        _disc = CFG.get("discovery") or {}
         report = await asyncio.to_thread(
             discover,
             INDEX, ROUTER, CFG["provider"]["name"],
             CFG["provider"]["base_url"],
             _api_key(),
             CFG["aliases"],
-            True,
-            (CFG.get("discovery") or {}).get("max_probes_per_pass"),
+            # Keyword from here on. These were positional, which silently binds
+            # by ORDER: inserting a parameter in discover()'s signature would
+            # have re-aimed max_probes at a different argument with no error.
+            probe_new=True,
+            max_probes=_disc.get("max_probes_per_pass"),
+            probe_top_n=_disc.get("probe_top_n"),
+            tier_overrides=(CFG.get("router") or {}).get("tier_overrides") or {},
         )
         _audit(audit, {"ts": started, "ok": True,
                        "duration_s": round(time.time() - started, 1),

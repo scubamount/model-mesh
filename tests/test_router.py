@@ -72,15 +72,20 @@ def test_eol_model_can_return(index):
 
 def test_request_time_410_marks_gone_immediately(index):
     """The maverick lesson: EOL detection must not wait for discovery."""
-    index.sync_catalog("nim", {"dead", "alive"})
-    router, t = make_router(index, {"dead": [(410, {"detail": "EOL"})]})
-    res = router.route(["dead", "alive"], {"messages": []}, "retain")
-    assert res.ok and res.model_id == "alive"
-    assert index.breaker_get("dead")["state"] == "gone"
-    assert "dead" not in index.live_models("nim")
+    # Ids chosen so the EOL'd model is dialed FIRST. ranked() breaks exact ties
+    # by model id, so a "dead"/"alive" pair puts alive first, it succeeds on
+    # attempt one, and the 410 model is never dialed at all — the test would
+    # then pass or fail on alphabetical luck rather than on EOL handling.
+    # "a-dead" sorts ahead of "b-alive", making the 410 path unavoidable.
+    index.sync_catalog("nim", {"a-dead", "b-alive"})
+    router, t = make_router(index, {"a-dead": [(410, {"detail": "EOL"})]})
+    res = router.route(["a-dead", "b-alive"], {"messages": []}, "retain")
+    assert res.ok and res.model_id == "b-alive"
+    assert index.breaker_get("a-dead")["state"] == "gone"
+    assert "a-dead" not in index.live_models("nim")
     # and it is never tried again
-    res2 = router.route(["dead", "alive"], {"messages": []}, "retain")
-    assert res2.attempts[0].model_id == "alive"
+    res2 = router.route(["a-dead", "b-alive"], {"messages": []}, "retain")
+    assert res2.attempts[0].model_id == "b-alive"
 
 
 # --- cascade ----------------------------------------------------------------

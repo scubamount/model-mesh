@@ -20,7 +20,19 @@ from typing import Optional
 
 from .index import SCORE_WINDOW_S, Index
 from .opclass import check_fidelity, probe_messages
+from .quality import tier as quality_tier
 from .router import Router
+
+# A model that has not served a single successful request in this long is
+# treated as retired even while the catalog still lists it. Discovery skips it
+# instead of spending a probe, then admits exactly one probe per window so a
+# model that genuinely returns comes back on its own.
+#
+# 7 days matches EOL_RECHECK_S and REJECT_RECHECK_S — the same "strong evidence,
+# never permanent" trade the rest of the system makes. Long enough that a
+# multi-day NIM outage does not retire a good model, short enough that a
+# genuinely dead one stops costing a probe a day.
+DORMANT_AFTER_S = 7 * 86400.0
 
 
 def fetch_catalog(base: str, api_key: str, timeout: float = 30.0) -> set[str]:
@@ -74,6 +86,10 @@ def discover(
     probe_new: bool = True,
     max_probes: Optional[int] = None,
     stale_after_s: float = SCORE_WINDOW_S,
+    probe_top_n: Optional[int] = None,
+    dormant_after_s: float = DORMANT_AFTER_S,
+    tier_overrides: Optional[dict] = None,
+    fetch=None,
     log=print,
 ) -> dict:
     """One discovery pass. Returns the sync report augmented with probe results.
@@ -81,6 +97,19 @@ def discover(
     `max_probes` caps how many distinct models are probed per pass so a wide
     catalog cannot turn a daily job into an unbounded burn. Remaining models are
     picked up by later passes.
+
+    `probe_top_n` limits probing to the best few candidates per alias instead of
+    every model in the catalog. We do not need to know the health of all 24
+    models — only of the handful we would actually route to. A model we would
+    never dial is one whose health is worth nothing, and probing it costs a real
+    request against a shared free endpoint. Ordering is by quality tier, so the
+    models kept warm are the ones worth having.
+
+    `dormant_after_s` skips models that have failed every attempt for this long.
+    NIM retires models without removing them from the catalog, so `live` is not
+    the same as `servable`; without this, a model that 404s forever is re-probed
+    on every pass forever. It is a SKIP, not an EOL — one probe still runs after
+    the dormancy window so a genuinely returning model comes back on its own.
 
     `stale_after_s` must track Index.score()'s window. Evidence EXPIRES: score()
     only reads samples newer than its window, so a model whose last sample is
@@ -94,7 +123,12 @@ def discover(
     is still self-limiting: real traffic refreshes the winner for free, so only
     models that are NOT being routed to ever cost a probe.
     """
-    live = fetch_catalog(base, api_key)
+    # Resolved at CALL time, not bound as a default. A default of
+    # `fetch=fetch_catalog` captures the function object at import, which
+    # silently defeats `monkeypatch.setattr("model_mesh.discovery.fetch_catalog")`
+    # — the module attribute is rebound but this default still points at the
+    # original, so six offline tests started making real network calls.
+    live = (fetch or fetch_catalog)(base, api_key)
     report = index.sync_catalog(provider, live)
     for mid in report["new"]:
         log(f"[mesh-discover] NEW  {mid}")
@@ -122,17 +156,43 @@ def discover(
         # serving requests is refreshed for free by that traffic.
         stale_cutoff = time.time() - stale_after_s
         op_classes_needed: dict[str, list[str]] = {}
+        dormant_skipped: list[str] = []
         for alias, cfg in aliases.items():
             oc = cfg.get("op_class", "retain")
-            for mid in candidates_for(index, provider, cfg):
+            pool = candidates_for(index, provider, cfg)
+            # Probe only the models we would actually route to. Health is worth
+            # knowing about a candidate and worthless about a model the router
+            # would never dial, and every probe is a real request against a
+            # shared free endpoint. Ordering by quality tier keeps the STRONGEST
+            # few warm rather than an arbitrary or alphabetical few.
+            #
+            # This is the practical shape of the problem: NIM's catalog is ~24
+            # usable text models and grows, but the cascade only ever tries
+            # max_attempts (3) of them. Probing all 24 to pick 3 spends the
+            # budget proving that models we will not use are fine.
+            if probe_top_n is not None:
+                pool = sorted(
+                    pool, key=lambda m: (-quality_tier(m, tier_overrides), m)
+                )[:probe_top_n]
+            for mid in pool:
                 # last_sample_ts returns 0.0 (not None) when a model has never
                 # been sampled — `is not None` would skip every model and probe
                 # nothing at all.
                 if index.last_sample_ts(mid, oc) > stale_cutoff:
                     continue  # evidence still inside the scoring window
+                # Long-dead model: listed in the catalog but not serving. Skip
+                # until the dormancy window elapses, then allow exactly one
+                # probe — a model that has come back rebuts its own dormancy
+                # with a single success, so this can never be a one-way door.
+                if index.dormant_since(mid, dormant_after_s) is not None:
+                    if mid not in dormant_skipped:
+                        dormant_skipped.append(mid)
+                    continue
                 op_classes_needed.setdefault(mid, [])
                 if oc not in op_classes_needed[mid]:
                     op_classes_needed[mid].append(oc)
+        for mid in dormant_skipped:
+            log(f"[mesh-discover] DORMANT {mid} (no success in window — skipping probe)")
 
         budget = max_probes if max_probes is not None else len(op_classes_needed)
         # Probe the STALEST evidence first, never alphabetically. `sorted()` on

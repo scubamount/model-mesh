@@ -681,37 +681,39 @@ def _seed_live_consolidation_regime(index, mid):
 
 
 def test_proven_model_is_not_evicted_by_unproven_ones(index):
-    """The live regression, end to end through ranking and the candidate cap."""
-    from model_mesh.index import NEUTRAL_PRIOR
+    """The live regression, restated for quality-first ranking.
+
+    ORIGINAL FORM (2026-08-08): a 36/36 proven model scored 49.2 on the old
+    blended float, eleven n=1 newcomers were pinned at exactly 50.0, and with
+    max_candidates=8 the one model proven to do the job was evicted from the
+    cascade entirely.
+
+    That arithmetic is gone — ranking is now (availability, quality, latency)
+    and there is no prior for thin evidence to hide behind. The GUARANTEE is
+    what survives, and it is stronger here: a model with a real track record
+    must never be pushed out of the cascade by models that have merely been
+    probed once.
+
+    The fixture keeps the proven model HEALTHY (its p95 is inside the overload
+    threshold). The original fixture's 74.7s p95 is, under the new rules,
+    genuinely an overloaded model, and preferring healthy newcomers to it is
+    the intended behavior rather than a regression — so testing eviction needs
+    a fixture where availability does not decide the outcome.
+    """
     from model_mesh.router import Router, RouterConfig
 
-    proven = "nvidia/llama-3.3-nemotron-super-49b-v1"
-    _seed_live_consolidation_regime(index, proven)
+    proven = "nvidia/llama-3.3-nemotron-super-49b-v1"   # tier 4
+    for _ in range(36):
+        index.record(proven, "consolidation", "request", "ok", 3_000.0, 12_000)
 
     s = index.score(proven, "consolidation")
     assert s.success_rate == 1.0 and s.n == 36
-    assert s.p95_ms < RouterConfig().max_p95_ms_for_eligibility, (
-        f"precondition: p95={s.p95_ms:.0f}ms must stay under the latency floor, "
-        f"or _eligible() drops the model before ranking runs and the test "
-        f"fails for the wrong reason")
+    assert s.p95_ms < RouterConfig().overload_p95_ms, (
+        "precondition: the proven model must be HEALTHY, or it is demoted for "
+        "being overloaded and the test proves nothing about eviction")
 
-    # The precondition that makes this bug possible AT ALL: the proven model's
-    # honest score is BELOW the prior that unproven models are pinned to. If a
-    # fixture scores above the prior, the floor is a no-op and this test passes
-    # with the bug fully reinstated (measured: a 55.3-scoring fixture did).
-    raw_below_prior = (
-        0.30 * max(0.0, 1.0 - (s.p95_ms / 30_000.0))
-        + 0.30 * max(0.0, 1.0 - min(s.jitter, 1.0))
-        + 0.20 * (1.0 - s.spike_rate)
-        + 0.20 * s.success_rate
-    ) * 100.0
-    assert raw_below_prior < NEUTRAL_PRIOR, (
-        f"precondition: the proven model's raw score ({raw_below_prior:.1f}) must "
-        f"be below NEUTRAL_PRIOR ({NEUTRAL_PRIOR}) — that is what lets unproven "
-        f"models outrank it; above the prior, the floor cannot be exercised")
-
-    # Eleven single-probe newcomers, each fast enough to score ~99 raw.
-    newcomers = [f"vendor/newcomer-{i:02d}" for i in range(11)]
+    # Eleven single-probe newcomers, each far faster but a weaker tier.
+    newcomers = [f"vendor/newcomer-{i:02d}-3b" for i in range(11)]
     for m in newcomers:
         index.record(m, "consolidation", "probe", "ok", 500.0, 12_000)
 
@@ -719,28 +721,33 @@ def test_proven_model_is_not_evicted_by_unproven_ones(index):
     ranked = r.ranked([proven] + newcomers, "consolidation")
 
     assert ranked[0] == proven, (
-        f"36/36 proven model must outrank single-probe newcomers; "
-        f"got {ranked[:3]}")
+        f"a proven, healthy, higher-tier model must outrank single-probe "
+        f"newcomers; got {ranked[:3]}")
     assert proven in ranked[:8], (
         "with max_candidates=8 the proven model must stay in the cascade")
 
 
 def test_thin_evidence_still_cannot_outrank_a_better_proven_model(index):
-    """The original guarantee must survive the fix: a lucky fast probe does not
-    beat a model with a real track record."""
+    """A lucky fast probe on a weak model does not beat a stronger model.
+
+    Same guarantee as before the ranking change, and now it holds for a
+    structural reason rather than a numerical one: llama-3.1-8b is tier 2 and
+    gpt-oss-120b is tier 5, so no amount of thin fast evidence promotes the
+    smaller model while both are healthy.
+    """
     from model_mesh.router import Router, RouterConfig
 
     import random
     rnd = random.Random(5)
     for _ in range(20):
         index.record("openai/gpt-oss-120b", "retain", "request", "ok",
-                     rnd.uniform(15_000, 30_000), 12_000)
+                     rnd.uniform(3_000, 9_000), 12_000)
     index.record("meta/llama-3.1-8b-instruct", "retain", "probe", "ok", 400.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
     ranked = r.ranked(["meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b"], "retain")
     assert ranked[0] == "openai/gpt-oss-120b", (
-        "an n=1 probe must not outrank a 20-sample proven model")
+        "an n=1 probe on a small model must not outrank a proven larger one")
 
 
 def test_thin_evidence_sorts_below_a_proven_model_at_the_prior(index):
