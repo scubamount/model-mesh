@@ -65,18 +65,79 @@ SQLite at `~/.model-mesh/mesh.db`. Tables:
 - `breaker` — current circuit state per model (healthy / down / recovering /
   auth / gone), consecutive fails, cooldown_until.
 
-Stability score per (model, op_class), computed over a sliding window
-(default 24h), FCM-inspired weights:
+### Ranking: quality orders, availability gates
+
+The mesh's job is uptime for hindsight on free NIM endpoints, where models go
+overloaded or vanish unpredictably — that churn is the only reason to probe
+anything. Two properties matter, on two different timescales, and blending them
+into a single number is what broke:
+
+| | timescale | measurable? | role |
+|---|---|---|---|
+| **quality** | slow-moving, effectively static | not by any probe here | **orders** candidates |
+| **availability** | hour to hour | only by probing | **gates** them |
 
 ```
-score = 0.30 * p95_latency_component
-      + 0.30 * jitter_component        (stdev / median)
-      + 0.20 * spike_rate_component    (samples > 3x median)
-      + 0.20 * success_rate_component
+rank_key = (availability_bucket, -quality_tier, p95_ms, model_id)
+             healthy < overloaded < unknown < failing
 ```
 
-Ranking = healthy models sorted by score. A model with one lucky fast ping
-does not outrank a consistently-good one — variance is measured, not assumed.
+Take the best model that is actually up right now. Deterministic — same
+evidence, same order, every call. `unknown` outranks `failing`: a model with no
+evidence is a maybe, and a maybe beats one measured broken.
+
+**Latency is an overload signal, not a quality measure.** On a shared free
+endpoint a slow response is not a property of the model, it is other people
+using it — and the model answering in 44s is the one about to start timing out.
+Past `overload_p95_ms` (20s) a model drops below everything healthy whatever its
+tier, and is promoted back for free when its measured p95 recovers. Nothing
+marks or unmarks it.
+
+**Quality tier** (1–5) is derived from the model id: parameter count, else a
+size adjective, else mid. That deliberately contradicts this codebase's rule
+against guessing capability from names, and the tension resolves on *which*
+question. "Can this model do the job?" is measurable, so it is measured by the
+fidelity probe and never guessed. "Is this model stronger?" is not measurable by
+any probe here — a latency probe cannot tell a 550b from a 1b except by the 1b
+winning, which is the exact inversion being fixed. Tiers are derived from the
+live catalog (new models tier on arrival, no edit), are a prior rather than a
+verdict (a top-tier model that is down loses to a healthy lower tier), and are
+overridable per model id via `router.tier_overrides`.
+
+Unknown sizes tier **mid, never bottom** — `glm-5.2` and `minimax-m3` publish no
+parameter count and are frontier models; tiering them last would quietly exclude
+exactly what we want.
+
+<details>
+<summary>Superseded: the blended stability score (removed 2026-08-09)</summary>
+
+Ranking was one float over a 24h window:
+
+```
+score = 0.30 * p95_latency + 0.30 * jitter + 0.20 * spike_rate + 0.20 * success_rate
+```
+
+Every term measures availability; none measures quality, so a 1b model outranked
+a 120b whenever it answered faster — the wrong objective for a memory backbone.
+
+It had also lost all resolution. Measured live on `auto/retain`: 23 scored
+models spanning p95 0.4s–44.3s, **every score inside [49.9, 50.0]**, because
+confidence shrinkage pinned thin evidence just below a neutral prior and floored
+proven models at it. Ordering fell through to the alphabetical tiebreak, and
+`gemma-4-31b-it` held rank 0 at p95 44.3s with jitter 4.77 and a falling success
+rate — visibly degrading, structurally unbeatable.
+
+A randomized exploration arm (`explore_rate`, 10%) was tried first and made the
+ranking corrigible without making it correct: challengers still gained evidence
+one sample at a time and stayed capped below the prior until n=8. It is gone.
+
+**Tell worth keeping: alphabetical order in `ranking_all` means nothing is
+actually scored.**
+</details>
+
+`samples` still records p95/jitter/spike/success per (model, op_class) — those
+drive the availability bucket, the eligibility floors and the breakers. What
+changed is that they no longer pretend to rank quality.
 
 ### Request-time routing (the part nim-proxy never had)
 
@@ -124,11 +185,31 @@ cooldown (cap 30 min).
   (default: skip if a real sample landed in the last 10 min — traffic is
   telemetry, don't burn quota double-checking it).
 
+**Probe economy.** Probing is not free: every probe is a real request against a
+shared free endpoint, and the quota it spends is the quota a newly-released
+model needs. Two bounds, both from what probing is actually *for* — detecting
+overload and disappearance, the only two things that change unpredictably:
+
+- `discovery.probe_top_n` (default 6) — probe only the best few candidates per
+  alias, ordered by quality tier. The cascade tries at most 3 models, so the
+  health of the 20th-best is worth nothing while costing a real request.
+  Set to `null` to probe the whole pool.
+- `DORMANT_AFTER_S` (7 days) — a model with no successful request in a week is
+  treated as retired even while the catalog still lists it. NIM lists models it
+  will not serve: measured 17 of 18 models retired on request-time 404s were
+  still in the catalog, so catalog presence cannot answer "is this real". It is
+  a skip, not an EOL — one probe still runs per window, and a single success
+  clears dormancy with no separate resurrection path to maintain.
+
 ### API surface
 
 - `POST /v1/chat/completions` — OpenAI-compatible; `model` = alias or raw id.
 - `GET /v1/models` — upstream catalog passthrough + aliases.
 - `GET /mesh/status` — ranking, breaker states, last sync, per-alias health.
+  Includes `rank_inputs` (quality tier + availability bucket per ranked model),
+  so the ordering is explainable from the response alone — the previous ranking
+  failure was invisible precisely because status showed an order with no way to
+  see the reason for it.
 - `GET /mesh/models` — the index: scores, history summary, EOL list.
 - `POST /mesh/probe` — force a re-probe (used by cron; rate-limited).
 - `GET /health` — **deep** health: catalog reachable AND ≥1 healthy model per
@@ -140,7 +221,17 @@ cooldown (cap 30 min).
 `~/.model-mesh/config.yaml` — providers (base URL + key env var), aliases →
 op_class + candidate filters (include/exclude patterns — the pool is
 discovered, not enumerated), breaker/probe tunables. Secrets stay in env,
-never in the DB or config.
+never in the DB or config. Defaults ship in `model_mesh/config.py`, so the
+daemon boots with no config file at all.
+
+Ranking/probe knobs worth knowing:
+
+| key | default | meaning |
+|---|---|---|
+| `router.overload_p95_ms` | `20000` | above this p95, a model is treated as overloaded and demoted below everything healthy |
+| `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the parameter-count heuristic misjudges a model |
+| `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` probes the whole pool |
+| `discovery.max_probes_per_pass` | `25` | hard ceiling on probes in one pass |
 
 ## Compatibility
 
