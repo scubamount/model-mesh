@@ -346,23 +346,48 @@ def test_boolean_probe_still_works_for_callers(index):
 # problem — it was one observation outweighing twenty.
 
 
+# -- evidence vs. entitlement --------------------------------------------------
+# These six tests were written against the blended stability score and its
+# confidence shrinkage (raw*c + NEUTRAL_PRIOR*(1-c), capped by
+# THIN_EVIDENCE_MARGIN). That machinery was deleted on 2026-08-09 along with the
+# score itself, so every one of them failed on an ImportError or AttributeError.
+#
+# They are retargeted rather than removed. The arithmetic they asserted is gone,
+# but the GUARANTEE behind them is not: a model measured once must not displace
+# one with a real track record, and a probed model must still be able to earn
+# its way in. Under quality-first ranking that guarantee is enforced structurally
+# by rank_key rather than by score arithmetic, so the assertions move to
+# Router.ranked() — the thing that actually decides.
+
+
 def test_single_sample_does_not_outrank_a_proven_model(index):
+    """A newcomer with one lucky fast probe must not displace a proven model.
+
+    Under the old score this was arithmetic (shrinkage toward a prior). Now it
+    is structural: both are the same quality tier, so ordering falls to the
+    availability bucket, and a model measured once at 400ms is HEALTHY exactly
+    like the proven one — the tiebreak is p95, which is the honest comparison.
+    The failure this guards against is the newcomer winning while the proven
+    model is healthy and the newcomer is NOT.
+    """
     from model_mesh.index import OK
+    from model_mesh.router import Router, RouterConfig
 
+    # proven: healthy and fast. newcomer: one sample, but overloaded.
     for _ in range(20):
-        index.record("proven", "retain", "request", OK, 28_000.0, 12_000)
-    index.record("newcomer", "retain", "probe", OK, 400.0, 12_000)
+        index.record("nvidia/proven-31b", "retain", "request", OK, 2_000.0, 12_000)
+    index.record("nvidia/newcomer-31b", "retain", "probe", OK, 44_000.0, 12_000)
 
-    proven = index.score("proven", "retain")
-    newcomer = index.score("newcomer", "retain")
-    assert proven.score > newcomer.score, (
-        f"n=1 newcomer ({newcomer.score}) outranked n=20 proven ({proven.score})"
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    order = r.ranked(["nvidia/newcomer-31b", "nvidia/proven-31b"], "retain")
+    assert order[0] == "nvidia/proven-31b", (
+        f"an overloaded n=1 newcomer outranked a healthy proven model: {order}"
     )
 
 
 def test_newcomer_still_beats_an_unknown(index):
-    """Shrinkage must not freeze the pool: a probed model still sorts above a
-    never-measured one, or nothing new can ever earn its way in."""
+    """The pool must not freeze: a probed model sorts above a never-measured
+    one, or nothing new can ever earn its way in."""
     from model_mesh.index import OK
     from model_mesh.router import Router, RouterConfig
 
@@ -374,86 +399,86 @@ def test_newcomer_still_beats_an_unknown(index):
     assert order[0] == "newcomer", f"probed model did not outrank unknown: {order}"
 
 
-def test_confidence_converges_with_evidence(index):
-    """A genuinely fast model must reach the top once it has real evidence —
-    shrinkage is a delay, not a permanent penalty."""
-    from model_mesh.index import OK, CONFIDENT_N
+def test_evidence_is_not_entitlement(index):
+    """A model that USED to work does not keep a slot once it degrades.
 
-    for _ in range(20):
-        index.record("slow", "retain", "request", OK, 28_000.0, 12_000)
-    for _ in range(CONFIDENT_N):
-        index.record("fast", "retain", "request", OK, 400.0, 12_000)
-
-    assert index.score("fast", "retain").score > index.score("slow", "retain").score
-
-
-def test_shrinkage_does_not_rescue_a_failing_model(index):
-    """The prior must not lift a model that is measurably bad."""
+    This is the inverse of the test above and the reason the old shrinkage had
+    to go: it floored a proven model at the prior, which meant a well-evidenced
+    model kept its rank while measurably degrading. 2026-08-09, live: gemma
+    (n=36, 97% success) held rank 0 at p95 44.3s while challengers measured
+    under 3s.
+    """
     from model_mesh.index import OK
+    from model_mesh.router import Router, RouterConfig
 
-    for _ in range(20):
-        index.record("good", "retain", "request", OK, 2_000.0, 12_000)
-    for _ in range(20):
-        index.record("bad", "retain", "request", "http-500", None, 12_000)
+    for _ in range(36):
+        index.record("nvidia/incumbent-31b", "retain", "request", OK, 44_000.0, 12_000)
+    for _ in range(3):
+        index.record("nvidia/challenger-31b", "retain", "request", OK, 2_500.0, 12_000)
 
-    assert index.score("good", "retain").score > index.score("bad", "retain").score
-
-
-def test_shrinkage_never_lifts_a_newcomer_above_a_proven_model(index):
-    """Regression: shrinking toward a FIXED 50.0 prior lifted an n=1 model above
-    nemotron-super-49b (n=29, p95 66.2s, raw 53.5) — a real consolidation
-    workhorse — because the prior sat above the workhorse's honest score. The
-    prior must be capped by the raw score so shrinkage is only ever a penalty."""
-    from model_mesh.index import OK, NEUTRAL_PRIOR
-    import random
-
-    # Proven but genuinely slow AND variable — the measured nemotron-super-49b
-    # consolidation profile (n=29, median 35.8s, jitter 0.550, p95 66.2s ->
-    # raw 53.5). Identical latencies give zero jitter and a 70.0 score, and a
-    # uniform spread only reaches jitter 0.355; neither reproduces the live
-    # bug. The jitter component is what drags the honest score under the prior,
-    # so the spread has to match what was actually observed.
-    rnd = random.Random(7)
-    for _ in range(29):
-        # lognormal-ish: mostly near the median with a long slow tail
-        v = rnd.choice([rnd.uniform(8_000.0, 20_000.0)] * 2
-                       + [rnd.uniform(30_000.0, 45_000.0)] * 3
-                       + [rnd.uniform(60_000.0, 90_000.0)])
-        index.record("workhorse", "consolidation", "request", OK, v, 12_000)
-    # newcomer with one fast sample
-    index.record("newcomer", "consolidation", "probe", OK, 500.0, 12_000)
-
-    work = index.score("workhorse", "consolidation")
-    new = index.score("newcomer", "consolidation")
-    # The live failure had the workhorse at raw 53.5 — only slightly above the
-    # 50.0 prior. That small margin is the whole bug: shrinking a fast n=1
-    # model toward 50.0 lands it at ~56, which clears 53.5. Assert the regime
-    # (workhorse close to the prior), not an arbitrary threshold.
-    assert abs(work.score - NEUTRAL_PRIOR) < 10.0, (
-        f"precondition: this regression needs the workhorse's honest score near "
-        f"the prior ({NEUTRAL_PRIOR}); got {work.score}"
-    )
-    assert work.score > new.score, (
-        f"n=1 newcomer ({new.score}) outranked n=29 proven workhorse "
-        f"({work.score}) — the prior is subsidizing thin evidence"
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    order = r.ranked(["nvidia/incumbent-31b", "nvidia/challenger-31b"], "retain")
+    assert order[0] == "nvidia/challenger-31b", (
+        f"a degraded incumbent kept rank 0 on track record alone: {order}"
     )
 
 
-def test_shrinkage_is_never_a_subsidy(index):
-    """General property: a model's shrunk score never EXCEEDS its raw score."""
-    from model_mesh.index import OK, CONFIDENT_N, NEUTRAL_PRIOR
+def test_a_failing_model_ranks_below_everything_measured_working(index):
+    """Measured failure is the worst bucket — no amount of evidence rescues it."""
+    from model_mesh.index import OK
+    from model_mesh.router import Router, RouterConfig
 
-    for latency in (300.0, 5_000.0, 29_000.0, 66_000.0):
-        mid = f"m{int(latency)}"
-        index.record(mid, "retain", "probe", OK, latency, 12_000)
-        s = index.score(mid, "retain")
-        # reconstruct the unshrunk score with a fully-confident model
-        for _ in range(CONFIDENT_N):
-            index.record(f"{mid}_full", "retain", "request", OK, latency, 12_000)
-        full = index.score(f"{mid}_full", "retain")
-        assert s.score <= full.score + 0.05, (
-            f"{mid}: n=1 score {s.score} exceeds fully-evidenced {full.score}"
-        )
+    for _ in range(20):
+        index.record("nvidia/good-31b", "retain", "request", OK, 2_000.0, 12_000)
+    for _ in range(20):
+        index.record("nvidia/bad-31b", "retain", "request", "http-500", None, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    order = r.ranked(["nvidia/bad-31b", "nvidia/good-31b"], "retain")
+    assert order[0] == "nvidia/good-31b", f"a failing model ranked first: {order}"
+    # Stronger than "ranks last": eligibility drops it from the cascade
+    # entirely, so it never burns an attempt. Asserting last place would have
+    # been satisfied by a one-element list — check membership explicitly.
+    assert "nvidia/bad-31b" not in order, (
+        f"a model measured 0% success over 20 samples is still eligible: {order}"
+    )
+
+
+def test_quality_outranks_speed_at_equal_availability(index):
+    """The defect that motivated the rewrite: a small fast model beating a large
+    one. Both healthy -> the stronger model wins even though it is slower."""
+    from model_mesh.index import OK
+    from model_mesh.router import Router, RouterConfig
+
+    index.record("meta/llama-3.1-8b-instruct", "retain", "probe", OK, 400.0, 12_000)
+    index.record("openai/gpt-oss-120b", "retain", "probe", OK, 3_000.0, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    order = r.ranked(["meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b"], "retain")
+    assert order[0] == "openai/gpt-oss-120b", (
+        f"a 8b model outranked a 120b on speed alone: {order}"
+    )
+
+
+def test_ranking_has_resolution_across_a_latency_spread(index):
+    """The collapse that hid the old bug: 23 models spanning p95 0.4s-44.3s all
+    scored inside [49.9, 50.0], so ordering fell through to the alphabetical
+    tiebreak. Assert the ranking actually SEPARATES its inputs — a metric that
+    cannot distinguish its inputs is not measuring them."""
+    from model_mesh.index import OK
+    from model_mesh.router import Router, RouterConfig
+
+    # same tier, same bucket, latencies an order of magnitude apart, and named
+    # so that alphabetical order is the REVERSE of the correct order.
+    ids = ["nvidia/a-slow-31b", "nvidia/b-mid-31b", "nvidia/c-fast-31b"]
+    for mid, lat in zip(ids, (18_000.0, 6_000.0, 900.0)):
+        index.record(mid, "retain", "probe", OK, lat, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    order = r.ranked(list(ids), "retain")
+    assert order == ["nvidia/c-fast-31b", "nvidia/b-mid-31b", "nvidia/a-slow-31b"], (
+        f"ranking did not separate a 20x latency spread (alphabetical fallback?): {order}"
+    )
 
 
 # -- EOL churn -----------------------------------------------------------------
@@ -750,16 +775,27 @@ def test_thin_evidence_still_cannot_outrank_a_better_proven_model(index):
         "an n=1 probe on a small model must not outrank a proven larger one")
 
 
-def test_thin_evidence_sorts_below_a_proven_model_at_the_prior(index):
-    """The margin exists so the two cannot tie at exactly 50.0, where ordering
-    would fall to arbitrary insertion order."""
-    from model_mesh.index import NEUTRAL_PRIOR
+def test_exact_ties_break_deterministically_not_by_insertion_order(index):
+    """Two models identical on every ranked dimension must still order stably.
 
-    proven = "proven/slow-but-reliable"
-    _seed_live_consolidation_regime(index, proven)
-    index.record("vendor/newcomer", "consolidation", "probe", "ok", 500.0, 12_000)
+    This replaces an assertion about the THIN_EVIDENCE_MARGIN, which existed so
+    thin evidence and a proven model could not tie at exactly 50.0 and fall
+    through to dict insertion order. The margin is gone with the score, but the
+    hazard it guarded is permanent: rank_key ends in model_id precisely so an
+    exact tie resolves by name instead of by whatever order the caller happened
+    to build the list in. Same input, either order in, same order out.
+    """
+    from model_mesh.router import Router, RouterConfig
 
-    ps = index.score(proven, "consolidation").score
-    ns = index.score("vendor/newcomer", "consolidation").score
-    assert ns < ps, f"thin evidence {ns} must sort below proven {ps}"
-    assert ps >= NEUTRAL_PRIOR, "a confident model is floored at the prior"
+    a, b = "nvidia/tie-one-31b", "nvidia/tie-two-31b"
+    for mid in (a, b):
+        for _ in range(10):
+            index.record(mid, "consolidation", "request", "ok", 5_000.0, 12_000)
+
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+    forward = r.ranked([a, b], "consolidation")
+    reverse = r.ranked([b, a], "consolidation")
+    assert forward == reverse, (
+        f"tied models ordered by insertion, not deterministically: "
+        f"{forward} vs {reverse}"
+    )

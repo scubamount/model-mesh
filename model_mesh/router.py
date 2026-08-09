@@ -23,7 +23,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .index import CONFIDENT_N, Index, OK
+from .index import Index, OK
 from .opclass import check_fidelity
 from .quality import rank_key
 

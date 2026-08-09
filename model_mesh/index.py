@@ -56,20 +56,15 @@ CREATE TABLE IF NOT EXISTS breaker (
 
 OK = "ok"
 
-# Samples required before a model's score is trusted at face value. Below this,
-# the score is shrunk toward NEUTRAL_PRIOR so a single fast probe cannot outrank
-# a model proven over dozens of real requests. 8 ~= two days of discovery probes
-# plus live traffic for an actually-used model.
+# Samples required before a model is treated as having a real track record.
+# Used by the pool-breadth invariant to distinguish "proven" from "measured
+# once". 8 ~= two days of discovery probes plus live traffic for an actively
+# used model.
+#
+# This no longer feeds a score. Until 2026-08-09 it drove confidence shrinkage
+# toward NEUTRAL_PRIOR (50.0) with a THIN_EVIDENCE_MARGIN tiebreak; that whole
+# mechanism went with the blended float. See Index.score().
 CONFIDENT_N = 8
-# Mid-scale prior: a barely-measured model sorts among mid-ranked proven models,
-# above unknowns but below anything with a real track record.
-NEUTRAL_PRIOR = 50.0
-
-# Thin evidence sorts just BELOW the prior so that a proven model scoring at
-# the prior still outranks it. Without this margin the two tie at 50.0 and
-# ordering falls to dict insertion order, which is alphabetical by model id —
-# i.e. arbitrary. Small enough that newcomers still sort well above unknowns.
-THIN_EVIDENCE_MARGIN = 0.1
 
 # Statuses that mean "the provider understood the request and refused it" — a
 # deterministic capability verdict, not a transient failure. Recorded by
@@ -103,8 +98,15 @@ SCORE_WINDOW_S = 86400.0
 
 @dataclass
 class Score:
+    """Measured evidence, not a verdict.
+
+    Deliberately holds no aggregate: ranking is `quality.rank_key()`, which
+    reads these fields directly. A single blended float lived here until
+    2026-08-09 and had to go — it ranked availability while presenting itself
+    as quality, and had collapsed to a 0.1-wide band across a 100x latency
+    spread. Adding one back re-creates both failures.
+    """
     model_id: str
-    score: float          # 0-100, higher = better
     p95_ms: float
     jitter: float         # stdev/median
     spike_rate: float
@@ -326,12 +328,23 @@ class Index:
     def score(
         self, model_id: str, op_class: str, window_s: float = SCORE_WINDOW_S
     ) -> Optional[Score]:
-        """FCM-inspired stability score over the sliding window.
+        """Measured evidence for one model on one op_class, over the window.
 
-        0.30 p95-latency + 0.30 jitter + 0.20 spike-rate + 0.20 success-rate.
-        Latency components are normalized against a 30s ceiling — anything at
-        or beyond that is 0. Returns None when there are no samples in-window
-        (an unknown model is neither good nor bad; the router probes it first).
+        Returns the raw measurements — p95, jitter, spike-rate, success-rate,
+        sample count — and does NOT reduce them to a single number. Ranking is
+        `quality.rank_key()`, which reads these fields directly.
+
+        There used to be a blended float here (0.30 p95 + 0.30 jitter + 0.20
+        spike + 0.20 success, with confidence shrinkage toward a neutral prior).
+        It was removed on 2026-08-09 with the ranking rewrite: every term
+        measured availability, none measured quality, so a 1b model outranked a
+        120b whenever it answered faster. Worse, the blend had no resolution —
+        23 live models spanning p95 0.4s-44.3s all landed inside [49.9, 50.0]
+        and ordering fell through to the alphabetical tiebreak.
+
+        Returns None when there are no samples in-window: an unknown model is
+        neither good nor bad, and `availability_bucket` sorts it above anything
+        measured failing but below anything measured healthy.
         """
         cutoff = time.time() - window_s
         with self._lock:
@@ -348,7 +361,8 @@ class Index:
         if not oks:
             # All failures in-window. p95 uses the 30s ceiling (not inf — the
             # value must survive JSON serialization in /mesh/status).
-            return Score(model_id, 0.0, 30_000.0, 1.0, 1.0, 0.0, n)
+            # success_rate 0.0 is what puts this model in BUCKET_FAILING.
+            return Score(model_id, 30_000.0, 1.0, 1.0, 0.0, n)
 
         med = statistics.median(oks)
         p95 = sorted(oks)[max(0, int(len(oks) * 0.95) - 1)]
@@ -356,60 +370,7 @@ class Index:
         spikes = sum(1 for v in oks if v > 3 * med)
         spike_rate = spikes / len(oks)
 
-        ceil_ms = 30_000.0
-        lat_comp = max(0.0, 1.0 - (p95 / ceil_ms))
-        jit_comp = max(0.0, 1.0 - min(jitter, 1.0))
-        spk_comp = 1.0 - spike_rate
-        raw = 100.0 * (
-            0.30 * lat_comp + 0.30 * jit_comp + 0.20 * spk_comp
-            + 0.20 * success_rate
-        )
-
-        # Confidence shrinkage. A single lucky probe is not evidence of
-        # reliability: on 2026-08-08 a widened pool put llama-3.1-8b (n=1,
-        # p95 0.4s, score 99.6) above gpt-oss-120b (n=20, p95 28.6s, score
-        # 56.5), which would have handed production retain traffic to a model
-        # measured exactly once. Jitter and spike-rate are also degenerate at
-        # n=1 (pstdev of one sample is 0, so the model scores a perfect
-        # consistency it has not demonstrated).
-        #
-        # Shrink toward a prior, then CAP the result at that prior while
-        # evidence is thin. Two earlier attempts were both wrong:
-        #
-        #   raw*c + 50.0*(1-c)          lifted an n=1 model to 56.2, above
-        #                               nemotron-super-49b (n=29, honest 51.8)
-        #   raw*c + min(50.0,raw)*(1-c) same outcome — capping the PRIOR does
-        #                               nothing when raw is huge (min(50,99)=50)
-        #
-        # An under-evidenced model must never outrank a well-evidenced one on
-        # the strength of a single fast sample, so below CONFIDENT_N its score
-        # is held at or under NEUTRAL_PRIOR. Newcomers still sort above
-        # unknowns and converge to their true score as samples accumulate.
-        #
-        # The cap alone is one-sided, and that asymmetry is a bug (observed
-        # 2026-08-08): it pins thin evidence AT the prior but lets a proven
-        # model score BELOW it, so unknowns outrank proof. nemotron-super-49b-v1
-        # — 36/36 consolidation successes, 100%, actively serving — scored 49.2
-        # (p95 74.7s is legitimately slow) and fell to rank 13, behind eleven
-        # n=1 models pinned at exactly 50.0. With max_candidates=8 it was
-        # evicted from the cascade entirely: the one model PROVEN to do the job
-        # could no longer be chosen for it.
-        #
-        # So a tie against thin evidence must break toward the proven model.
-        # Ranking sorts by score alone, so the tiebreak has to live in the
-        # score: hold thin evidence just BELOW the prior (not at it) and floor
-        # a confident model at the prior. Both bounds are needed — dropping
-        # either one restores the eviction.
-        confidence = min(1.0, n / CONFIDENT_N)
-        if confidence < 1.0:
-            shrunk = raw * confidence + NEUTRAL_PRIOR * (1.0 - confidence)
-            score = min(shrunk, NEUTRAL_PRIOR - THIN_EVIDENCE_MARGIN)
-        else:
-            # A model with CONFIDENT_N samples of real evidence ranks on its
-            # merits, but never loses its cascade slot to an unproven model.
-            score = max(raw, NEUTRAL_PRIOR)
-
-        return Score(model_id, round(score, 1), p95, round(jitter, 3),
+        return Score(model_id, p95, round(jitter, 3),
                      round(spike_rate, 3), round(success_rate, 3), n)
 
     # -- breaker ------------------------------------------------------------
