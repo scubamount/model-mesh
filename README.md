@@ -33,7 +33,7 @@ client (hindsight / hermes / opencode)
 │ model-mesh daemon (localhost only)          │
 │                                             │
 │  resolve alias → ranked candidate list      │
-│    (from index: stability score, breaker)   │
+│    (quality tier + availability, breaker)   │
 │  try #1 ──fail──▶ try #2 ──fail──▶ try #3   │
 │    │                                        │
 │    └── all failed? LIVE RE-PROBE the pool,  │
@@ -48,7 +48,8 @@ client (hindsight / hermes / opencode)
 ┌─────────────────────────────────────────────┐
 │ model index (SQLite, ~/.model-mesh/mesh.db) │
 │  catalog snapshots · probe+request history  │
-│  stability scores · breaker states · EOL log│
+│  latency/jitter/spike/success · breakers    │
+│  · EOL log                                  │
 └─────────────────────────────────────────────┘
 ```
 
@@ -139,6 +140,14 @@ actually scored.**
 drive the availability bucket, the eligibility floors and the breakers. What
 changed is that they no longer pretend to rank quality.
 
+`Score` carries those measurements and **no aggregate**: there is deliberately
+no single number to sort by. The blended float was deleted from the code on
+2026-08-09 (not just from the ranking), so `/mesh/status` no longer returns a
+`score` field per model — read `p95_ms`, `success_rate`, `n`, and `rank_inputs`
+instead. Anything reducing those to one number re-creates both failures above:
+it will rank availability while looking like quality, and it will lose
+resolution as soon as a prior or a cap is added to stabilize it.
+
 ### Request-time routing (the part nim-proxy never had)
 
 Per request:
@@ -210,8 +219,14 @@ overload and disappearance, the only two things that change unpredictably:
   so the ordering is explainable from the response alone — the previous ranking
   failure was invisible precisely because status showed an order with no way to
   see the reason for it.
-- `GET /mesh/models` — the index: scores, history summary, EOL list.
+- `GET /mesh/models` — the live upstream catalog (`live`, `count`) plus current
+  `breaker` state per model. Per-model measurements and ranking live on
+  `/mesh/status`, not here.
 - `POST /mesh/probe` — force a re-probe (used by cron; rate-limited).
+- `GET /mesh/discovery` — recent discovery `runs`: timestamp, duration, and the
+  `new` / `eol` / `returned` / `probed` sets per pass. This is the churn record
+  the whole probe design exists for — it shows models arriving and vanishing
+  from the free catalog without any log grepping.
 - `GET /health` — **deep** health: catalog reachable AND ≥1 healthy model per
   configured alias. Returns 503 otherwise. (The predecessor's `/health`
   could not fail while retain was down; this one can.)
@@ -222,7 +237,8 @@ overload and disappearance, the only two things that change unpredictably:
 op_class + candidate filters (include/exclude patterns — the pool is
 discovered, not enumerated), breaker/probe tunables. Secrets stay in env,
 never in the DB or config. Defaults ship in `model_mesh/config.py`, so the
-daemon boots with no config file at all.
+daemon boots with no config file at all — and currently does: there is no
+`config.yaml` on this machine, every value below is the shipped default.
 
 Ranking/probe knobs worth knowing:
 
@@ -235,10 +251,14 @@ Ranking/probe knobs worth knowing:
 
 ## Compatibility
 
-Drop-in for the nim-proxy contract hindsight already speaks:
-`openai/auto/retain`, `auto/consolidation`, `auto/reflect` aliases on an
-OpenAI-compatible localhost port. Cutover = change one port in
-`060-hindsight-setup.sh` (`:8001` → `:8002`), nothing else.
+Drop-in for the nim-proxy contract hindsight speaks: `openai/auto/retain`,
+`auto/consolidation`, `auto/reflect` aliases on an OpenAI-compatible localhost
+port.
+
+**Cutover is done.** Hindsight's profile (`~/.hindsight/profiles/hermes.env`)
+points every LLM base URL at `http://127.0.0.1:8002/v1` — retain, reflect and
+consolidation, each with a litellm fallback to a pinned `openai/gpt-oss-20b` on
+the same port. nim-proxy on `:8001` no longer serves this path.
 
 `auto/evolve` serves DSPy skill evolution (hermes-agent-self-evolution) on its
 own `evolve` op_class. Separate op_class, not a reuse of `retain`: scores are
@@ -254,8 +274,18 @@ hindsight's memory models.
 
 ## Ops
 
-- `scripts/install-launchd.sh` — daemon + daily discovery job.
-- Runs on `127.0.0.1:8002` (nim-proxy keeps `:8001` until cutover).
+- `scripts/install-launchd.sh` — daemon + daily discovery job. launchd labels:
+  `com.scubamount.model-mesh` (daemon) and `com.scubamount.model-mesh-discover`.
+- Runs on `127.0.0.1:8002`.
 - Logs: `~/.model-mesh/mesh.log` (daemon), audit JSONL `~/.model-mesh/audit/`.
 - State: everything under `~/.model-mesh/` — copy the dir, keep the history
   (portable to other machines by design).
+- **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
+  EOL marks accumulated from real traffic, reconstructible only by re-living
+  that time. It is not in git and nothing here regenerates it. It is backed up
+  by `scripts/backup-durable-state.sh` in `hermes-agent-patches` (sqlite
+  `.backup`, WAL-safe — a plain `cp` of a WAL-mode db in use can capture a torn
+  page), which runs as an `/aaa` step and is gated by the
+  `durable-state-backed-up` invariant on backup *freshness*, not on the script
+  existing. A running daemon is not a backup: uptime reads as safety, which is
+  why this had none for months.
