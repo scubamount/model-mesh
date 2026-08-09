@@ -91,6 +91,15 @@ REJECT_RECHECK_S = 7 * 86400.0
 # week instead of ~1/day.
 EOL_RECHECK_S = 7 * 86400.0
 
+# Sliding window for Index.score(). ONE definition, because discovery's
+# re-probe threshold must track it: score() ignores samples older than this, so
+# any model whose newest sample falls outside the window scores None and ranks
+# as "unknown" regardless of how good it measured. If discovery's staleness
+# threshold were larger than this window, models would expire out of scoring
+# faster than they get re-probed and the pool would silently collapse to
+# whichever model happens to carry live traffic.
+SCORE_WINDOW_S = 86400.0
+
 
 @dataclass
 class Score:
@@ -275,7 +284,7 @@ class Index:
     # -- scoring ------------------------------------------------------------
 
     def score(
-        self, model_id: str, op_class: str, window_s: float = 86400.0
+        self, model_id: str, op_class: str, window_s: float = SCORE_WINDOW_S
     ) -> Optional[Score]:
         """FCM-inspired stability score over the sliding window.
 

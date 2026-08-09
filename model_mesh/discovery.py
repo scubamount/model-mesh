@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import time
 import urllib.request
 from typing import Optional
 
-from .index import Index
+from .index import SCORE_WINDOW_S, Index
 from .opclass import check_fidelity, probe_messages
 from .router import Router
 
@@ -72,14 +73,26 @@ def discover(
     aliases: dict[str, dict],
     probe_new: bool = True,
     max_probes: Optional[int] = None,
+    stale_after_s: float = SCORE_WINDOW_S,
     log=print,
 ) -> dict:
     """One discovery pass. Returns the sync report augmented with probe results.
 
     `max_probes` caps how many distinct models are probed per pass so a wide
     catalog cannot turn a daily job into an unbounded burn. Remaining models are
-    picked up by later passes; steady state is ~0 probes because every model
-    already carries evidence.
+    picked up by later passes.
+
+    `stale_after_s` must track Index.score()'s window. Evidence EXPIRES: score()
+    only reads samples newer than its window, so a model whose last sample is
+    older than that scores None and sorts as "unknown" — behind every scored
+    model, alphabetically. Skipping any model that was ever sampled therefore
+    creates a one-way ratchet: probe once, fall out of the window, never get
+    re-probed, never score again. Observed 2026-08-09 with the retain alias, where
+    gpt-oss-120b (measured 3.8s and fidelity-passing) sat at rank 30 on 52h-old
+    evidence while gemma-4-31b-it (10.1s) served all traffic unopposed, purely
+    because gemma was the only model with fresh samples. Re-probing on staleness
+    is still self-limiting: real traffic refreshes the winner for free, so only
+    models that are NOT being routed to ever cost a probe.
     """
     live = fetch_catalog(base, api_key)
     report = index.sync_catalog(provider, live)
@@ -95,13 +108,19 @@ def discover(
     deferred: list[str] = []
     rejected: list[str] = []
     if probe_new:
-        # Probe models with NO evidence for an op_class — not merely the ones
-        # that are new in this pass. `report["new"]` is empty for everything
-        # present at bootstrap, so the original version left 95 of 102 live
-        # models permanently unranked: never new again, never sampled, never
-        # eligible. Backfilling by "has this model ever been sampled for this
-        # op_class" is self-limiting — each model is probed once per op_class,
-        # then real traffic maintains it for free.
+        # Probe models whose evidence for an op_class is MISSING or STALE — not
+        # merely the ones that are new in this pass. `report["new"]` is empty for
+        # everything present at bootstrap, so the original version left 95 of 102
+        # live models permanently unranked: never new again, never sampled, never
+        # eligible.
+        #
+        # "Ever sampled" was the wrong test. Evidence expires (SCORE_WINDOW_S), so
+        # a model probed once and then never routed to falls out of the scoring
+        # window and becomes permanently unknown — a one-way ratchet that hands
+        # the alias to whichever model already has traffic, forever. Re-probing on
+        # staleness closes it and stays self-limiting, because the model actually
+        # serving requests is refreshed for free by that traffic.
+        stale_cutoff = time.time() - stale_after_s
         op_classes_needed: dict[str, list[str]] = {}
         for alias, cfg in aliases.items():
             oc = cfg.get("op_class", "retain")
@@ -109,14 +128,27 @@ def discover(
                 # last_sample_ts returns 0.0 (not None) when a model has never
                 # been sampled — `is not None` would skip every model and probe
                 # nothing at all.
-                if index.last_sample_ts(mid, oc) > 0:
-                    continue  # already has evidence; scoring handles it
+                if index.last_sample_ts(mid, oc) > stale_cutoff:
+                    continue  # evidence still inside the scoring window
                 op_classes_needed.setdefault(mid, [])
                 if oc not in op_classes_needed[mid]:
                     op_classes_needed[mid].append(oc)
 
         budget = max_probes if max_probes is not None else len(op_classes_needed)
-        for mid in sorted(op_classes_needed):
+        # Probe the STALEST evidence first, never alphabetically. `sorted()` on
+        # model_id composes with the per-pass budget into a second ratchet: with
+        # 42 models needing probes and a budget of 25, everything from "n" onward
+        # is deferred every pass, forever. Live effect 2026-08-09: gpt-oss-120b
+        # and gpt-oss-20b were never probed for retain because "openai/" sorts
+        # past the cutoff, so the two fastest fidelity-passing models in the pool
+        # stayed unknown while 25 already-failing models were re-probed each pass.
+        # Oldest-evidence-first makes the budget a rotation instead of a wall:
+        # anything skipped this pass is strictly staler next pass, so it advances.
+        def _staleness_key(mid: str) -> tuple[float, str]:
+            ts = min(index.last_sample_ts(mid, oc) for oc in op_classes_needed[mid])
+            return (ts, mid)
+
+        for mid in sorted(op_classes_needed, key=_staleness_key):
             if budget <= 0:
                 log(f"[mesh-discover] probe budget exhausted, {mid} deferred to next pass")
                 break
