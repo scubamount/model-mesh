@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .index import Index, OK
+from .index import CONFIDENT_N, Index, OK
 from .opclass import check_fidelity
 
 logger = logging.getLogger("model_mesh.router")
@@ -79,6 +80,14 @@ class RouterConfig:
     # is 300s while 3 x 120s = 360s. Per-attempt timeout shrinks to fit what's
     # left, so the cascade always gets to try every candidate.
     total_budget_s: float = 240.0
+    # Exploration rate. Ranking is pure exploitation without it: evidence comes
+    # only from traffic, traffic goes only to rank 0, and score() pins anything
+    # under CONFIDENT_N samples below the neutral prior — so a challenger never
+    # accumulates the evidence that would let it win. See Router._explore.
+    # 0.10 costs one exploratory attempt in ten and is enough to carry a genuine
+    # challenger to CONFIDENT_N within a day of normal memory traffic. Set 0.0
+    # to disable (pure exploitation, previous behavior).
+    explore_rate: float = 0.10
 
 
 @dataclass
@@ -372,6 +381,49 @@ class Router:
 
     # -- the cascade ---------------------------------------------------------
 
+    def _explore(self, order: list[str], op_class: str) -> list[str]:
+        """Occasionally promote an under-evidenced model to first attempt.
+
+        Without this, ranking has no way to ever change its mind. Evidence only
+        accrues from traffic, traffic only goes to the top-ranked model, and
+        score() holds anything under CONFIDENT_N samples just below the neutral
+        prior — so a challenger sits at n=1 permanently no matter how good it is.
+
+        Observed 2026-08-09 on the retain alias: gpt-oss-120b measured p95 2.6s
+        and gemma-4-31b-it measured p95 28.9s, and gemma stayed rank 0 because it
+        was the only model with n >= CONFIDENT_N. Discovery cannot close this —
+        it probes for MISSING or STALE evidence, and the challenger's single
+        sample is neither. Exploitation without exploration is a local optimum
+        that reports itself as a global one.
+
+        Deliberately cheap and boring:
+          - only fires with probability `explore_rate`, so steady-state cost is
+            bounded and the incumbent still serves the overwhelming majority;
+          - only promotes a model that is ALREADY eligible and ranked, so
+            breakers, success-rate floors and latency floors all still apply —
+            exploration cannot resurrect a model those gates excluded;
+          - only promotes thin evidence (n < CONFIDENT_N). A model that already
+            has enough samples is being judged on merit, and reordering it would
+            be noise, not information;
+          - the promoted model goes FIRST but the rest of the cascade is
+            untouched, so a bad pick costs one failed attempt and falls straight
+            back to the incumbent.
+        """
+        if self.cfg.explore_rate <= 0.0 or len(order) < 2:
+            return order
+        if random.random() >= self.cfg.explore_rate:
+            return order
+
+        thin = [
+            m for m in order[1:]
+            if (s := self.index.score(m, op_class)) is None
+            or s.n < CONFIDENT_N
+        ]
+        if not thin:
+            return order
+        pick = random.choice(thin)
+        return [pick] + [m for m in order if m != pick]
+
     def route(
         self,
         candidates: list[str],
@@ -386,6 +438,7 @@ class Router:
             return deadline - time.monotonic()
 
         order = self.ranked(candidates, op_class)
+        order = self._explore(order, op_class)
         for model_id in order[: self.cfg.max_attempts]:
             left = _remaining()
             if left <= 1.0:
