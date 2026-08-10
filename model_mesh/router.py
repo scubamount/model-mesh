@@ -47,10 +47,26 @@ class RouterConfig:
     breaker_threshold: int = 3          # consecutive fails -> down
     breaker_cooldown_s: float = 120.0   # first cooldown
     breaker_cooldown_max_s: float = 1800.0
-    max_attempts: int = 3               # candidates tried before the re-probe arm
-    reprobe_top_n: int = 3              # models re-probed on total miss
-    request_timeout_s: float = 120.0
-    probe_timeout_s: float = 30.0
+    # Attempt COUNT must not be the binding constraint — the budget should be.
+    # Measured 2026-08-10: a deterministic 4xx reject costs 0.26s median, so a
+    # cascade can afford many of them, while max_attempts=3 gave up after three
+    # cheap rejects with ~99% of the budget still unspent. Set high enough that
+    # `left <= 1.0` (real time) is what ends a cascade, never an arbitrary count.
+    max_attempts: int = 8               # candidates tried before the re-probe arm
+    reprobe_top_n: int = 4              # models re-probed on total miss
+    # 90s, not 120s: a timeout burns this ENTIRE value (measured median 120.1s
+    # per http-598, 4323s total across 36 timeouts), so the per-attempt timeout
+    # sets the price of one failure. At 120s only two failures fit in a 240s
+    # budget and the third attempt was always 'skipped-budget' — max_attempts=3
+    # was unreachable in the worst case. Measured success latencies: p95 51.6s,
+    # p99 88.4s, max 117.8s, so 90s aborts ~1% of successes, and those cascade
+    # to another model instead of being lost.
+    request_timeout_s: float = 90.0
+    # 45.0 must match config.py DEFAULTS["router"]: app.py builds the live
+    # router as RouterConfig(**CFG["router"]), so config.py WINS at runtime and
+    # a differing dataclass default here is dead code that misleads readers.
+    # test_config_defaults_match_dataclass asserts the two stay in sync.
+    probe_timeout_s: float = 45.0
     # Auth failures must EXPIRE. They used to be terminal, and breaker state is
     # persisted in SQLite, so a single daemon start with a missing key (launchctl
     # setenv does not survive a restart of the machine) marked every model 'auth'
@@ -78,9 +94,16 @@ class RouterConfig:
     max_p95_ms_for_eligibility: float = 75_000.0
     # Whole-cascade budget. Must stay under the CLIENT's timeout or it gives up
     # mid-cascade and the failover never completes: hindsight's retain timeout
-    # is 300s while 3 x 120s = 360s. Per-attempt timeout shrinks to fit what's
-    # left, so the cascade always gets to try every candidate.
-    total_budget_s: float = 240.0
+    # is 300s. Per-attempt timeout shrinks to fit what's left, so the cascade
+    # always gets to try every candidate.
+    #
+    # 280s, not 240s: at request_timeout_s=90 this fits 3 full-price timeouts
+    # (3 x 90 = 270 < 280) where 240 fit only 2. Headroom to the 300s client
+    # timeout stays 20s. Raising this above ~295 would let the cascade outlive
+    # the client, which silently discards the write mid-failover — the exact
+    # failure this budget exists to prevent. audit-timeout-chain.py asserts
+    # total_budget_s < RETAIN_LLM_TIMEOUT and REFLECT_LLM_TIMEOUT.
+    total_budget_s: float = 280.0
     # p95 at or above this means "overloaded", not "slow model". On free shared
     # NIM endpoints latency tracks how many OTHER people are hitting a model
     # right now, so a model answering in 40s is not a worse model — it is the

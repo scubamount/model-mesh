@@ -292,6 +292,57 @@ def test_http_400_not_retried_and_not_breaker_counted(index):
     assert "not retryable" in res.attempts[0].detail
 
 
+def test_config_defaults_match_dataclass(index):
+    """app.py builds the live router as RouterConfig(**CFG["router"]), so
+    config.py DEFAULTS WIN at runtime. A differing dataclass default is dead
+    code that reads as truth — probe_timeout_s drifted 45 vs 30 unnoticed
+    until 2026-08-10. Every shared key must agree in both files.
+    """
+    from model_mesh.config import DEFAULTS
+    rc = RouterConfig()
+    drift = {
+        k: (v, getattr(rc, k))
+        for k, v in DEFAULTS["router"].items()
+        if hasattr(rc, k) and getattr(rc, k) != v
+    }
+    assert not drift, f"config.py vs RouterConfig drift: {drift}"
+
+
+def test_budget_fits_three_full_price_timeouts(index):
+    """The binding constraint on a cascade must be TIME, not attempt count.
+
+    2026-08-10: request_timeout_s=120 with total_budget_s=240 meant a timeout
+    (which burns the whole per-attempt timeout — measured median 120.1s) fit
+    only TWICE, so the 3rd of max_attempts=3 was always 'skipped-budget'.
+    max_attempts was unreachable in the worst case, i.e. the knob that looked
+    like the failover depth was not the one controlling it.
+    """
+    cfg = RouterConfig()
+    assert 3 * cfg.request_timeout_s < cfg.total_budget_s, (
+        "budget must fit >=3 full-price timeouts so failover depth is real"
+    )
+    # And the count must not become the new binding constraint.
+    assert cfg.max_attempts > cfg.total_budget_s / cfg.request_timeout_s, (
+        "max_attempts must exceed what the budget can fund, so TIME ends a "
+        "cascade rather than an arbitrary count"
+    )
+
+
+def test_cheap_rejects_do_not_exhaust_the_cascade(index):
+    """A deterministic 4xx costs ~0.26s. A run of them must not end a cascade
+    while the budget is essentially untouched — with max_attempts=3 three cheap
+    rejects burned <1s and still gave up."""
+    script: dict[str, list[tuple[int, dict]]] = {
+        f"m{i}": [(400, {"detail": "bad payload"})] for i in range(1, 8)
+    }
+    script["m8"] = [(200, {"choices": [{"message": {"content": "{}"}}]})]
+    router, t = make_router(index, script)
+    res = router.route([f"m{i}" for i in range(1, 9)], {"messages": []}, "retain")
+    assert res.ok and res.model_id == "m8", (
+        f"cascade gave up after {len(res.attempts)} cheap rejects"
+    )
+
+
 def test_cascade_respects_total_budget(index):
     """3 x 120s = 360s overran hindsight's own 300s retain timeout, so the
     client abandoned mid-cascade and failover never completed."""

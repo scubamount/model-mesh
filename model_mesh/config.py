@@ -57,9 +57,15 @@ DEFAULTS: dict = {
         "breaker_threshold": 3,
         "breaker_cooldown_s": 120.0,
         "breaker_cooldown_max_s": 1800.0,
-        "max_attempts": 3,
-        "reprobe_top_n": 3,
-        "request_timeout_s": 120.0,
+        # Attempt count must not be the binding constraint — the real-time
+        # budget should be. A 4xx reject costs 0.26s median, so three cheap
+        # rejects used to end a cascade with ~99% of the budget unspent.
+        "max_attempts": 8,
+        "reprobe_top_n": 4,
+        # A timeout burns this whole value, so it is the price of one failure.
+        # 90s aborts ~1% of measured successes (p95 51.6s, p99 88.4s) and those
+        # cascade onward rather than being lost; 120s let only 2 failures fit.
+        "request_timeout_s": 90.0,
         "probe_timeout_s": 45.0,
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
@@ -67,8 +73,9 @@ DEFAULTS: dict = {
         # the cascade; audit-timeout-chain.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,
         # Under hindsight's 300s RETAIN_LLM_TIMEOUT so the client never abandons
-        # mid-cascade (see 060-hindsight-setup.sh).
-        "total_budget_s": 240.0,
+        # mid-cascade (see 060-hindsight-setup.sh). 280 fits 3 full-price 90s
+        # timeouts (270 < 280) and keeps 20s headroom to the client.
+        "total_budget_s": 280.0,
     },
     # Cap on distinct models probed per discovery pass. Backfilling 67 unproven
     # models at ~14s each is ~15 min once; this bounds the tail so a catalog
