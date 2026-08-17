@@ -609,6 +609,46 @@ def test_deterministically_rejecting_model_is_ineligible(index):
         "a model that deterministically rejects retain must not stay eligible")
 
 
+def test_thin_evidence_repeated_failure_is_ineligible(index):
+    """The live 2026-08-16 bug: quality-first ranking put a measurably
+    failing model first in line for memory traffic.
+
+    openai/gpt-oss-120b sat at n=3 / success_rate 0.333 — below
+    min_samples_for_floor, so the sustained-failure floor never engaged, while
+    its tier-5 size sorted it to #1 on both auto/retain and auto/reflect. Two
+    failures out of three is evidence, not thin data.
+    """
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "openai/gpt-oss-120b"
+    index.record(mid, "retain", "chat", "ok", 1740.0, 900)
+    index.record(mid, "retain", "chat", "http-500", 1740.0, 900)
+    index.record(mid, "retain", "chat", "http-500", 1740.0, 900)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+
+    s = index.score(mid, "retain")
+    assert s.n < RouterConfig().min_samples_for_floor, (
+        "precondition: the bug exists BECAUSE n stays under the sample floor "
+        f"(n={s.n})")
+    assert s.success_rate < 0.5, f"precondition: majority-failing (got {s.success_rate})"
+    assert not r._eligible(mid, "retain"), (
+        "a model that has failed twice of three must not take live memory "
+        "traffic just because it has not yet earned a 4th sample")
+
+
+def test_thin_evidence_floor_spares_a_single_failure(index):
+    """One failure is noise. The thin-evidence floor must not evict on it, or
+    every model gets knocked out by its first hiccup and the pool collapses."""
+    from model_mesh.router import Router, RouterConfig
+
+    mid = "nvidia/nemotron-3-super-120b-a12b"
+    index.record(mid, "retain", "chat", "http-500", 1200.0, 900)
+    r = Router(index, "https://x/v1", "k", RouterConfig())
+
+    assert r._eligible(mid, "retain"), (
+        "a single failure is not evidence of a failing model")
+
+
 def test_reject_is_scoped_to_the_op_class(index):
     """A reject is about the request shape, not the model. nemotron-super-49b
     rejects retain (11.5k-12.6k char payloads) while serving consolidation at

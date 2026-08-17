@@ -69,6 +69,7 @@ DEFAULTS: dict = {
         "probe_timeout_s": 45.0,
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
+        "min_failures_for_thin_floor": 2,
         # Must satisfy 2 * this < total_budget_s so a slow model can't consume
         # the cascade; audit-timeout-chain.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,

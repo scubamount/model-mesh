@@ -83,6 +83,10 @@ class RouterConfig:
     # http-400 = deterministic payload rejection) but 100% on consolidation.
     min_success_rate: float = 0.5
     min_samples_for_floor: int = 4
+    # Absolute-failure gate for the thin-evidence arm of the success floor,
+    # used only below min_samples_for_floor. 2 = "failed twice", which no
+    # amount of missing samples explains away.
+    min_failures_for_thin_floor: int = 2
     # Latency floor, sibling of min_success_rate. A model can pass the success
     # floor and still be unusable: llama-3.3-70b sat at 61% success with p95
     # 96.9s and stayed ranked #2 on retain, so two attempts exhausted the 240s
@@ -227,6 +231,36 @@ class Router:
                     and s.n >= self.cfg.min_samples_for_floor
                     and s.success_rate < self.cfg.min_success_rate):
                 return False
+            # Thin-evidence failure floor. The floor above waits for
+            # min_samples_for_floor (4) samples, which is the right caution
+            # for a model that has merely been unlucky. It is the wrong
+            # caution for one that has already failed more often than it has
+            # succeeded: at n=3 / success_rate=0.333 the sample guard
+            # suppresses the floor, and because ranking is quality-first a
+            # tier-5 id then sorts to #1 and takes live memory traffic while
+            # measurably failing. Observed 2026-08-16 — openai/gpt-oss-120b,
+            # n=3, success_rate 0.333, bucket "healthy", ranked #1 on both
+            # auto/retain and auto/reflect.
+            #
+            # This arm exists for INTERMITTENT failure, which is exactly what
+            # the consecutive-fail breaker cannot see (ok/fail alternating
+            # never reaches breaker_threshold in a row). It must not preempt
+            # the breaker on the consecutive path: gating at 2 failures with
+            # breaker_threshold=3 made a model ineligible after its 2nd
+            # straight failure, so the 3rd request never ran, the breaker
+            # never opened, and no cooldown or recovery was ever scheduled.
+            # Requiring a success in the window keeps this to the alternating
+            # case and leaves an all-failure run to the breaker.
+            #
+            # Not an eviction: probes bypass _eligible(), so a model that
+            # recovers earns samples back and returns on its own.
+            if s is not None and s.n < self.cfg.min_samples_for_floor:
+                failures = round(s.n * (1.0 - s.success_rate))
+                successes = s.n - failures
+                if (successes >= 1
+                        and failures >= self.cfg.min_failures_for_thin_floor
+                        and s.success_rate < self.cfg.min_success_rate):
+                    return False
             # Latency floor. Success rate alone is not enough: a model can sit
             # above the success floor and still be unusable because a single
             # attempt eats the whole cascade budget. Observed 2026-08-07 —
