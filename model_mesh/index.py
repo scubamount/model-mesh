@@ -41,9 +41,11 @@ CREATE TABLE IF NOT EXISTS samples (
     source       TEXT NOT NULL,          -- request | probe | discovery
     latency_ms   REAL,                   -- NULL when the call never returned
     status       TEXT NOT NULL,          -- 'ok' | 'http-429' | 'timeout' | 'parse-fail' | ...
-    payload_chars INTEGER
+    payload_chars INTEGER,
+    request_id   TEXT                    -- groups attempts of ONE cascade; NULL for pre-2026-08-18 rows
 );
 CREATE INDEX IF NOT EXISTS idx_samples_model_ts ON samples (model_id, ts);
+CREATE INDEX IF NOT EXISTS idx_samples_request ON samples (request_id);
 CREATE TABLE IF NOT EXISTS breaker (
     model_id       TEXT PRIMARY KEY,
     state          TEXT NOT NULL DEFAULT 'healthy',  -- healthy|down|recovering|auth|gone
@@ -121,6 +123,20 @@ class Index:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Additive migration BEFORE the schema script: _SCHEMA creates an index on
+        # samples(request_id), and on a pre-2026-08-18 database that column does
+        # not exist yet, so running the script first fails with
+        # "no such column: request_id" and the router cannot open its own index.
+        # Existing rows keep NULL, which readers must treat as 'ungrouped' —
+        # never as though they all belonged to one request.
+        has_samples = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='samples'"
+        ).fetchone()
+        if has_samples:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(samples)")}
+            if "request_id" not in cols:
+                self._conn.execute("ALTER TABLE samples ADD COLUMN request_id TEXT")
+                self._conn.commit()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
@@ -226,13 +242,25 @@ class Index:
         status: str,
         latency_ms: Optional[float],
         payload_chars: Optional[int] = None,
+        request_id: Optional[str] = None,
     ) -> None:
+        """Record one ATTEMPT.
+
+        `request_id` groups the attempts of a single cascade, which is what makes
+        client-visible reliability computable at all. Without it a reader has to
+        cluster attempts by timestamp, and that is not merely imprecise — it is
+        wrong: hindsight issues concurrent retains, so a 120s window mixes
+        unrelated requests and reports a failure rate that is pure artifact.
+        Measured 2026-08-18, timestamp clustering claimed 5.00% client-visible
+        failure over 24h; the "failed cascade" it pointed at was a single timeout
+        surrounded by 40+ successes from other requests.
+        """
         with self._lock:
             self._conn.execute(
                 "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
-                " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
+                " status, payload_chars, request_id) VALUES (?,?,?,?,?,?,?,?)",
                 (model_id, time.time(), op_class, source, latency_ms, status,
-                 payload_chars),
+                 payload_chars, request_id),
             )
             self._conn.commit()
 

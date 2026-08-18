@@ -18,6 +18,7 @@ import json
 import logging
 import random
 import time
+import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -304,7 +305,7 @@ class Router:
 
     def _call(
         self, model_id: str, body: dict, op_class: str, source: str,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None, request_id: Optional[str] = None,
     ) -> tuple[Optional[dict], Attempt]:
         url = self.upstream_base + "/chat/completions"
         headers = {
@@ -323,14 +324,16 @@ class Router:
         ms = (time.monotonic() - t0) * 1000.0
 
         if status_code == 200:
-            self.index.record(model_id, op_class, source, OK, ms, payload_chars)
+            self.index.record(model_id, op_class, source, OK, ms, payload_chars,
+                              request_id=request_id)
             self._on_success(model_id)
             return payload, Attempt(model_id, OK, ms)
 
         status = f"http-{status_code}"
         if status_code in GONE_CODES:
             self.index.mark_gone(model_id, status)
-            self.index.record(model_id, op_class, source, status, ms, payload_chars)
+            self.index.record(model_id, op_class, source, status, ms, payload_chars,
+                              request_id=request_id)
             return None, Attempt(model_id, status, ms, "gone: EOL'd at request time")
         if status_code in AUTH_CODES:
             self.index.breaker_set(
@@ -338,13 +341,15 @@ class Router:
                 cooldown_s=self.cfg.auth_cooldown_s,
                 cooldown_until=time.time() + self.cfg.auth_cooldown_s,
             )
-            self.index.record(model_id, op_class, source, status, ms, payload_chars)
+            self.index.record(model_id, op_class, source, status, ms, payload_chars,
+                              request_id=request_id)
             return None, Attempt(model_id, status, ms, "auth: check API key")
         if status_code in REJECT_CODES:
             # Recorded (so the success-rate floor sees it and stops picking this
             # model for this op_class) but NOT breaker-counted: the model is
             # healthy, it just refuses this shape of request.
-            self.index.record(model_id, op_class, source, status, ms, payload_chars)
+            self.index.record(model_id, op_class, source, status, ms, payload_chars,
+                              request_id=request_id)
             detail = str(payload.get("error", payload.get("detail", "")))[:200]
             # Log it: a 4xx is a CAPABILITY signal, not noise. Diagnosing the
             # 2026-08-07 nemotron rejections meant writing a repro script purely
@@ -358,7 +363,8 @@ class Router:
                 model_id, status, ms, f"rejected (not retryable): {detail}"
             )
         # transient (incl. 598 network / 599 malformed body)
-        self.index.record(model_id, op_class, source, status, ms, payload_chars)
+        self.index.record(model_id, op_class, source, status, ms, payload_chars,
+                              request_id=request_id)
         self._on_transient_fail(model_id)
         detail = str(payload.get("error", payload.get("detail", "")))[:200]
         logger.warning(
@@ -473,6 +479,10 @@ class Router:
         probe_messages: Optional[list[dict]] = None,
     ) -> RouteResult:
         result = RouteResult(ok=False)
+        # One id per cascade. Every attempt this route makes — including the
+        # re-probe arm's retries — carries it, so a reader can ask "did the
+        # CLIENT get an answer" instead of inferring it from timestamps.
+        request_id = uuid.uuid4().hex
         deadline = time.monotonic() + self.cfg.total_budget_s
 
         def _remaining() -> float:
@@ -492,6 +502,7 @@ class Router:
             payload, att = self._call(
                 model_id, body, op_class, source="request",
                 timeout=min(self.cfg.request_timeout_s, left),
+                request_id=request_id,
             )
             result.attempts.append(att)
             if payload is not None:
@@ -522,6 +533,7 @@ class Router:
                 payload, att = self._call(
                     model_id, body, op_class, source="request",
                     timeout=min(self.cfg.request_timeout_s, left),
+                    request_id=request_id,
                 )
                 result.attempts.append(att)
                 if payload is not None:
