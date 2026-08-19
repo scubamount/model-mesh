@@ -20,7 +20,7 @@ RETAIN_MESSAGES = [
             'object of the form {"facts": ["fact1", "fact2"]}. No prose, no markdown.'
         ),
     },
-    {"role": "user", "content": "Andrew dives in Monterey and prefers a 7mm wetsuit."},
+    {"role": "user", "content": "Scubamount dives in Monterey and prefers a 7mm wetsuit."},
 ]
 
 CONSOLIDATION_MESSAGES = [
@@ -35,7 +35,7 @@ CONSOLIDATION_MESSAGES = [
     {
         "role": "user",
         "content": json.dumps(
-            {"observation_id": "obs-4271", "text": "Andrew logged a 30m dive."}
+            {"observation_id": "obs-4271", "text": "Scubamount logged a 30m dive."}
         ),
     },
 ]

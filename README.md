@@ -289,3 +289,7 @@ hindsight's memory models.
   `durable-state-backed-up` invariant on backup *freshness*, not on the script
   existing. A running daemon is not a backup: uptime reads as safety, which is
   why this had none for months.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

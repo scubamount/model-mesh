@@ -3,6 +3,8 @@ name = "model-mesh"
 version = "0.1.0"
 description = "Health-aware OpenAI-compatible model router with a persistent model index, circuit breakers, cascade failover, and live re-probe recovery."
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",

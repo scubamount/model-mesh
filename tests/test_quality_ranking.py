@@ -137,7 +137,7 @@ def t_quality_beats_speed(tmp):
 
 @check("availability outranks quality: overloaded flagship loses to a healthy small model")
 def t_availability_first(tmp):
-    # Andrew's morning scenario: the big model is up but buried under other
+    # Scubamount's morning scenario: the big model is up but buried under other
     # users' load. Uptime is the mesh's whole job, so we take the healthy one.
     idx = _index(tmp)
     r = _router(idx)
