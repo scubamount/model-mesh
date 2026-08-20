@@ -109,6 +109,57 @@ def run(monkeypatched_catalog=True):
             FRESH not in probed,
         ))
 
+        # 3b. THE BOUNDARY, which check 3 above cannot see. FRESH is sampled
+        #     "now", so it proves only that obviously-fresh evidence is skipped.
+        #     The live defect lived at the far edge of the window: discovery runs
+        #     once per 24h and stale_after_s was ALSO 24h, so a model probed
+        #     23.96h ago read as fresh, was skipped, and expired 131 seconds
+        #     later — auto/evolve carried 0 scored models for a full day
+        #     (2026-08-20). Equal periods with independent phase always lose
+        #     eventually; this asserts the refresh happens with margin.
+        idx3 = Index(os.path.join(tmp, "boundary.db"))
+        near = "boundary/expires-in-minutes"
+        idx3.sync_catalog(PROVIDER, {near})
+        idx3.record(near, "retain", "probe", "ok", 3000.0)
+        # 99% of the way through the window: still scoreable RIGHT NOW, but gone
+        # long before a once-daily pass comes round again.
+        idx3._conn.execute(
+            "UPDATE samples SET ts=? WHERE model_id=?",
+            (time.time() - (SCORE_WINDOW_S * 0.99), near),
+        )
+        idx3._conn.commit()
+
+        # The fixture must be non-vacuous in BOTH directions: the model has to
+        # still score now (else "unscored tomorrow" proves nothing) and has to
+        # be inside the raw window (else it is just the stale case again).
+        checks.append((
+            "boundary fixture still scores today (not yet expired)",
+            idx3.score(near, "retain") is not None,
+        ))
+
+        r3 = FakeRouter()
+        orig3 = disc.fetch_catalog
+        disc.fetch_catalog = lambda base, key, timeout=30.0: {near}
+        try:
+            discover(
+                idx3, r3, PROVIDER, "http://x", "k", ALIASES,
+                probe_new=True, log=lambda *a, **k: None,
+            )
+        finally:
+            disc.fetch_catalog = orig3
+
+        checks.append((
+            "about-to-expire model is re-probed before it expires",
+            near in {m for m, _ in r3.probed},
+        ))
+
+        # And the constant that buys the margin must stay a fraction. At >= 1.0
+        # the race returns silently and the symptom reads as a provider outage.
+        checks.append((
+            "REFRESH_MARGIN is strictly inside the scoring window",
+            0.0 < disc.REFRESH_MARGIN < 1.0,
+        ))
+
         # 4. The staleness threshold must track the scoring window. If discovery
         #    tolerated evidence older than score() accepts, models would expire
         #    out of ranking faster than they are re-probed.

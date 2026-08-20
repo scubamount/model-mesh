@@ -34,6 +34,37 @@ from .router import Router
 # genuinely dead one stops costing a probe a day.
 DORMANT_AFTER_S = 7 * 86400.0
 
+# Refresh evidence BEFORE it expires, not exactly when it does.
+#
+# `stale_after_s` used to equal SCORE_WINDOW_S (24h) while the discovery pass
+# itself runs once every 24h (StartCalendarInterval 06:15 local). Two equal
+# periods with independent phase is a guaranteed miss, and it fired: on
+# 2026-08-20 the auto/evolve lane's newest probe was 23.96h old — 131 SECONDS
+# short of the cutoff — so every candidate read as "evidence still inside the
+# scoring window", nothing was probed, and the evidence expired two minutes
+# later. Result: auto/evolve carried 0 scored models for a full day while
+# retain and consolidation (refreshed for free by live hindsight traffic) each
+# carried 6. A lane with no live traffic of its own can ONLY be scored by this
+# pass, so missing it by two minutes costs the whole day, every day, until some
+# unrelated jitter shifts the phase.
+#
+# Refreshing at 80% of the window means a once-daily pass always re-probes with
+# ~4.8h of margin. It cannot cause extra probes for a busy lane: real traffic
+# keeps last_sample_ts inside the window regardless, and probe_top_n still caps
+# breadth. Ratio, not a constant, so it tracks any change to SCORE_WINDOW_S —
+# the invariant that matters is margin < window, and the assert below enforces
+# the direction rather than trusting the arithmetic.
+REFRESH_MARGIN = 0.8
+
+# Direction, not arithmetic: a margin of 1.0 or more silently restores the
+# 24h-vs-24h race this constant exists to remove, and the symptom (one lane
+# unscored for a day) looks like a provider problem rather than a config one.
+assert 0.0 < REFRESH_MARGIN < 1.0, (
+    f"REFRESH_MARGIN must be a fraction of SCORE_WINDOW_S strictly under 1.0 "
+    f"(got {REFRESH_MARGIN}); at >= 1.0 discovery refreshes evidence no earlier "
+    f"than it expires and a once-daily pass loses any lane it misses by seconds"
+)
+
 
 def fetch_catalog(base: str, api_key: str, timeout: float = 30.0) -> set[str]:
     url = base.rstrip("/") + "/models"
@@ -85,7 +116,7 @@ def discover(
     aliases: dict[str, dict],
     probe_new: bool = True,
     max_probes: Optional[int] = None,
-    stale_after_s: float = SCORE_WINDOW_S,
+    stale_after_s: float = SCORE_WINDOW_S * REFRESH_MARGIN,
     probe_top_n: Optional[int] = None,
     dormant_after_s: float = DORMANT_AFTER_S,
     tier_overrides: Optional[dict] = None,
@@ -111,10 +142,13 @@ def discover(
     on every pass forever. It is a SKIP, not an EOL — one probe still runs after
     the dormancy window so a genuinely returning model comes back on its own.
 
-    `stale_after_s` must track Index.score()'s window. Evidence EXPIRES: score()
-    only reads samples newer than its window, so a model whose last sample is
-    older than that scores None and sorts as "unknown" — behind every scored
-    model, alphabetically. Skipping any model that was ever sampled therefore
+    `stale_after_s` must track Index.score()'s window and land STRICTLY INSIDE
+    it (SCORE_WINDOW_S * REFRESH_MARGIN — see the constant for the incident).
+    Evidence EXPIRES: score() only reads samples newer than its window, so a
+    model whose last sample is older than that scores None and sorts as
+    "unknown" — behind every scored model, alphabetically. Setting this equal to
+    the window makes a once-daily pass race the expiry and lose by seconds.
+    Skipping any model that was ever sampled therefore
     creates a one-way ratchet: probe once, fall out of the window, never get
     re-probed, never score again. Observed 2026-08-09 with the retain alias, where
     gpt-oss-120b (measured 3.8s and fidelity-passing) sat at rank 30 on 52h-old
