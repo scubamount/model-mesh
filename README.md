@@ -36,8 +36,10 @@ client (hindsight / hermes / opencode)
 │    (quality tier + availability, breaker)   │
 │  try #1 ──fail──▶ try #2 ──fail──▶ try #3   │
 │    │                                        │
-│    └── all failed? LIVE RE-PROBE the pool,  │
-│        rebuild ranking, one more cascade;   │
+│    ├── all failed? LIVE RE-PROBE the pool,  │
+│    │   rebuild ranking, one more cascade;   │
+│    └── still failed? SWEEP the rest of the  │
+│        ranked pool (deduped, budget-bound); │
 │        only then 503 (with models_tried)    │
 │                                             │
 │  every real request updates the index       │
@@ -163,11 +165,20 @@ Per request:
    success intervenes or the weekly recheck elapses. The cascade ends on
    TIME (`total_budget_s`), never on an attempt count.
 4. **All tried and failed → live re-probe**: hit `/v1/models` + 1-token pings
-   on the top pool, rebuild ranking from fresh data, run ONE more cascade.
+   on the pool, rebuild ranking from fresh data, run ONE more cascade.
    This is the "if nothing works, ping again and find what's actually up
    right now" arm — it converts a stale-index total-miss into a recovery
    instead of an outage.
-5. Still nothing → `503` with `models_tried` + per-model failure reasons.
+5. **Still nothing → last-resort sweep**: walk the rest of the ranked pool
+   (ranks beyond the first cascade) and dial each directly — no probe
+   round-trip — skipping models this request already dialed and terminal
+   `gone` ghosts, until one serves or `total_budget_s` dies. This is what
+   makes "no healthy candidates" require a whole-pool failure inside a
+   single request: hindsight retain/consolidation must fail only when every
+   live NIM model actually failed within that request. (`sweep_on_total_miss`,
+   capped at `sweep_max_models` dials; both mirrored in `config.py`.)
+6. Even the sweep missed → `503` with `models_tried` + per-model failure
+   reasons.
 
 Status-code discipline (learned from FCM):
 

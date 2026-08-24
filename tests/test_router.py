@@ -296,8 +296,12 @@ def test_config_defaults_match_dataclass(index):
     """app.py builds the live router as RouterConfig(**CFG["router"]), so
     config.py DEFAULTS WIN at runtime. A differing dataclass default is dead
     code that reads as truth — probe_timeout_s drifted 45 vs 30 unnoticed
-    until 2026-08-10. Every shared key must agree in both files.
+    until 2026-08-10. Every shared key must agree in both files, and every
+    RouterConfig field must EXIST in DEFAULTS (else RouterConfig(**CFG) would
+    not even construct with a future field).
     """
+    import dataclasses
+
     from model_mesh.config import DEFAULTS
     rc = RouterConfig()
     drift = {
@@ -306,6 +310,13 @@ def test_config_defaults_match_dataclass(index):
         if hasattr(rc, k) and getattr(rc, k) != v
     }
     assert not drift, f"config.py vs RouterConfig drift: {drift}"
+    missing_in_cfg = (
+        {f.name for f in dataclasses.fields(RouterConfig)}
+        - set(DEFAULTS["router"].keys())
+    )
+    assert not missing_in_cfg, (
+        f"RouterConfig fields absent from DEFAULTS['router']: {missing_in_cfg}"
+    )
 
 
 def test_budget_fits_three_full_price_timeouts(index):
@@ -566,3 +577,123 @@ def test_reprobed_true_only_after_a_probe_ran(index):
     res = router.route(["m1", "m2"], {"messages": []}, "retain",
                        probe_messages=PROBE)
     assert res.ok and res.reprobed is True
+
+
+# --- last-resort sweep arm ---------------------------------------------------
+
+def test_sweep_reaches_candidates_beyond_max_attempts(index):
+    """2026-08-24 episode: 26-model pool, every ranked candidate failing. The
+    main loop dials only ranked[:max_attempts]; ranks beyond it are never
+    DIALED directly (the re-probe arm probe-gates them). The sweep must dial
+    into that untouched range — here every model the first two arms can reach
+    fails, and the rescue sits at the very back of the queue."""
+    # 10 candidates; first max_attempts=3 all fail; the six middle models
+    # fail too (re-probe arm would rescue h1 otherwise); z-reserve healthy.
+    cands = ["c1", "c2", "c3", "h1", "h2", "h3", "h4", "h5", "h6", "z-reserve"]
+    script = {m: [(500, {})] for m in ("c1", "c2", "c3",
+                                       "h1", "h2", "h3",
+                                       "h4", "h5", "h6")}
+    router, t = make_router(index, script,
+                            max_attempts=3, reprobe_top_n=0,
+                            probe_timeout_s=45.0, total_budget_s=280.0)
+    res = router.route(cands, {"messages": []}, "retain",
+                       probe_messages=PROBE)
+    assert res.ok and res.model_id == "z-reserve" and res.swept
+    assert t.calls.count("z-reserve") == 1
+    # Every failure dialed exactly once: no retry storm.
+    for m in ("c1", "c2", "c3"):
+        assert t.calls.count(m) == 1
+
+
+def test_sweep_runs_after_full_reprobe_miss(index):
+    """Order guarantee: reprobe runs (a-arm1 probe passes) AND misses (its
+    re-dial fails), b-probe-busy fails everywhere it is touched, and only the
+    sweep reaches d-sweep beyond max_attempts."""
+    ok_body = {"choices": [{"message": {"content": '{"facts": ["x"]}'}}],
+               "model": "a-arm1"}
+    script = {
+        # main dial fail -> probe pass -> re-dial fail: reprobe ran and missed.
+        "a-arm1": [(500, {}), (200, ok_body), (500, {})],
+        # probe busy, sweep dial ALSO fails -> swept past.
+        # (pop order: main, probe, sweep-dial)
+        "b-probe-busy": [(500, {}), (500, {}), (500, {})],
+        # d-sweep unscripted EXCEPT its probe: script probe-busy so the
+        # re-probe arm passes it over; the sweep dial then hits the default
+        # 200 and the SWEEP is the rescuer.
+        "d-sweep": [(500, {})],
+    }
+    router, t = make_router(index, script, max_attempts=1, reprobe_top_n=4)
+    res = router.route(["a-arm1", "b-probe-busy", "d-sweep"],
+                       {"messages": []}, "retain", probe_messages=PROBE)
+    assert res.ok and res.model_id == "d-sweep"
+    assert res.swept
+    assert t.calls.count("a-arm1") == 3      # main + probe + re-dial
+    # b sits beyond max_attempts=1: no main dial, just probe + sweep dial.
+    assert t.calls.count("b-probe-busy") == 2
+    assert t.calls.count("d-sweep") == 2     # probe(busy) + sweep dial(ok)
+
+
+def test_sweep_dedupes_against_reprobe_dials(index):
+    """A model the re-probe arm already re-dialed sits inside the sweep's
+    slice (ranks >= max_attempts, reprobe_top_n > max_attempts) and must NOT
+    be dialed a third time. One retry is the stale-state rescue; two is a
+    retry storm."""
+    ok_b = {"choices": [{"message": {"content": '{"facts": ["x"]}'}}],
+            "model": "b-mid"}
+    script = {
+        # rank 0: main fail, probe pass, re-dial fail.
+        "a-head": [(500, {}),
+                   (200, {**ok_b, "model": "a-head"}),
+                   (500, {})],
+        # ranks 1-2: probe pass, re-dial fail -> redialed by reprobe arm.
+        "b-mid": [(200, ok_b), (500, {})],
+        "c-mid": [(200, {**ok_b, "model": "c-mid"}), (500, {})],
+        # rank 3 (e-tail): unscripted -> its probe would pass and hand it to
+        # the re-probe arm before any sweep; script probe-busy so ONLY the
+        # sweep can reach it (sweep dial then hits default 200).
+        "e-tail": [(500, {})],
+    }
+    router, t = make_router(index, script,
+                            max_attempts=1, reprobe_top_n=4)
+    res = router.route(["a-head", "b-mid", "c-mid", "e-tail"],
+                       {"messages": []}, "retain", probe_messages=PROBE)
+    assert res.ok and res.model_id == "e-tail" and res.swept
+    # reprobed is False here BY DESIGN: the flag means "rescued by the
+    # re-probe arm". This request was rescued by the sweep.
+    assert t.calls.count("a-head") == 3    # main + probe + one re-dial
+    assert t.calls.count("b-mid") == 2     # probe + ONE re-dial, not three
+    assert t.calls.count("c-mid") == 2
+    assert t.calls.count("e-tail") == 2    # probe(busy) + sweep dial(ok)
+
+
+def test_sweep_skips_gone_models(index):
+    """The sweep's gone-check guards a RACE: a model marked gone by a
+    concurrent request AFTER our ranking was computed still sits in `order`
+    and must not be swept. a-marker (rank 0) fails and marks z-late gone
+    mid-request; both later arms must pass over the freshly-dead ghost."""
+    def transport(url, body, headers, timeout):
+        if body["model"] == "a-marker":
+            # Concurrent discovery retires z-late after our ranking.
+            index.mark_gone("z-late", "http-404")
+        return 500, {}
+    r = Router(index, "http://up/v1", "k", RouterConfig(
+        max_attempts=1, reprobe_top_n=4), transport=transport)
+    res = r.route(["a-marker", "z-late"], {"messages": []}, "retain",
+                  probe_messages=PROBE)
+    assert not res.ok          # nothing healthy remains; ghost must NOT serve
+    # z-late: zero attempts anywhere — skipped by re-probe AND sweep.
+    assert not [a for a in res.attempts if a.model_id == "z-late"]
+
+
+def test_sweep_respects_budget(index):
+    """Budget exhausted before the sweep starts -> no sweep dials, honest
+    skipped-budget attempts."""
+    r = Router(index, "http://up/v1", "k",
+               RouterConfig(total_budget_s=0.05, request_timeout_s=0.04),
+               transport=lambda u, b, h, t: (time.sleep(t), (500, {}))[1])
+    cands = [f"m{i}" for i in range(12)]
+    res = r.route(cands, {"messages": []}, "retain", probe_messages=None)
+    assert not res.ok
+    dial_statuses = [a.status for a in res.attempts if a.status != "skipped-budget"]
+    assert all(s != OK for s in dial_statuses)
+

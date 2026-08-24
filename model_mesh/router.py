@@ -105,6 +105,24 @@ class RouterConfig:
     # Raise it only if total_budget_s rises too — audit-timeout-chain.py checks
     # the relationship.
     max_p95_ms_for_eligibility: float = 75_000.0
+    # Last-resort sweep. The main loop dials ranked[:max_attempts]. On total
+    # miss the re-probe arm PROBES down the whole list, but pays one probe
+    # round-trip per candidate and stops at reprobe_top_n passes — ranks
+    # beyond max_attempts are probe-gated, never DIALED directly, and a model
+    # that times out a 45s probe can still serve a 90s real request. After
+    # both arms miss, the sweep walks the REST of the candidate list in
+    # ranked order — skipping already-dialed ids and terminal 'gone' models,
+    # dialing straight away with the real body — until something serves or
+    # the budget dies. This is what makes "no healthy candidates" nearly
+    # unreachable: retain must fail only when literally every live model
+    # failed within one request.
+    #
+    # Dedupe against every attempt of THIS request (main + re-probe retries)
+    # so no upstream sees two dials for one client call. Mirrored in
+    # config.py DEFAULTS["router"]; test_config_defaults_match_dataclass
+    # asserts sync.
+    sweep_on_total_miss: bool = True
+    sweep_max_models: int = 12
     # Whole-cascade budget. Must stay under the CLIENT's timeout or it gives up
     # mid-cascade and the failover never completes: hindsight's retain timeout
     # is 300s. Per-attempt timeout shrinks to fit what's left, so the cascade
@@ -152,6 +170,7 @@ class RouteResult:
     response: Optional[dict] = None
     attempts: list[Attempt] = field(default_factory=list)
     reprobed: bool = False
+    swept: bool = False
 
 
 class Router:
@@ -605,5 +624,47 @@ class Router:
                         True, model_id, payload,
                     )
                     return result
+
+        # Last-resort sweep. Both arms above only ever touch the top of the
+        # ranked list; this walks the rest. Dedupe against EVERY dial this
+        # request already made (main loop + re-probe retries): one failure is
+        # evidence enough and an upstream must never see two dials for one
+        # client call. 'gone' stays terminal — EOL'd ghosts are not candidates.
+        if self.cfg.sweep_on_total_miss and not result.ok:
+            dialed = {a.model_id for a in result.attempts}
+            swept_any = False
+            swept_count = 0
+            for model_id in order[self.cfg.max_attempts:]:
+                if swept_count >= self.cfg.sweep_max_models:
+                    break
+                if model_id in dialed or self.index.breaker_get(
+                        model_id)["state"] == "gone":
+                    continue
+                left = _remaining()
+                if left <= 1.0:
+                    result.attempts.append(
+                        Attempt(model_id, "skipped-budget", None,
+                                "cascade budget exhausted")
+                    )
+                    break
+                payload, att = self._call(
+                    model_id, body, op_class, source="sweep",
+                    timeout=min(self.cfg.request_timeout_s, left),
+                    request_id=request_id,
+                )
+                result.attempts.append(att)   # EVERY dial is recorded
+                swept_any = True
+                swept_count += 1
+                if payload is not None and att.status == OK:
+                    # Fidelity gate already ran inside _call: a 200 here is a
+                    # contract-obeying answer, same guarantee as every arm.
+                    result.swept = True
+                    result.ok, result.model_id, result.response = (
+                        True, model_id, payload,
+                    )
+                    return result
+                dialed.add(model_id)
+            if swept_any:
+                result.swept = True
 
         return result

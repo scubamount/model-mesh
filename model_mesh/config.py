@@ -62,6 +62,14 @@ DEFAULTS: dict = {
         # rejects used to end a cascade with ~99% of the budget unspent.
         "max_attempts": 8,
         "reprobe_top_n": 4,
+        # Last-resort sweep (2026-08-24): after max_attempts dials AND the
+        # re-probe arm both miss, walk the REST of the ranked pool — deduped
+        # against every model this request already dialed, 'gone' excluded,
+        # budget-bound like every arm. Makes "no healthy candidates" require
+        # a whole-pool failure inside one request. Must match RouterConfig;
+        # test_config_defaults_match_dataclass asserts sync.
+        "sweep_on_total_miss": True,
+        "sweep_max_models": 12,
         # A timeout burns this whole value, so it is the price of one failure.
         # 90s aborts ~1% of measured successes (p95 51.6s, p99 88.4s) and those
         # cascade onward rather than being lost; 120s let only 2 failures fit.
@@ -82,6 +90,15 @@ DEFAULTS: dict = {
         # mid-cascade (see 060-hindsight-setup.sh). 280 fits 3 full-price 90s
         # timeouts (270 < 280) and keeps 20s headroom to the client.
         "total_budget_s": 280.0,
+        # p95 at/above this = overloaded, demoted below healthy regardless of
+        # quality tier; free re-promotion when measured p95 recovers.
+        "overload_p95_ms": 20000.0,
+        # Auth failures must expire (launchctl setenv does not survive reboot;
+        # a daemon start with a missing key must not brick the index).
+        "auth_cooldown_s": 300.0,
+        # Per-model quality-tier overrides {model_id: 1..5}. Empty by design:
+        # the heuristic derives from the live catalog, static pins rot.
+        "tier_overrides": {},
     },
     # Cap on distinct models probed per discovery pass. Backfilling 67 unproven
     # models at ~14s each is ~15 min once; this bounds the tail so a catalog
