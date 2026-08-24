@@ -715,7 +715,8 @@ def test_transient_failure_is_not_treated_as_a_reject(index):
 # NEUTRAL_PRIOR but let a proven model score BELOW it, so unknowns outranked
 # proof. nvidia/llama-3.3-nemotron-super-49b-v1 — 36/36 consolidation successes,
 # 100%, actively serving — scored 49.2 (p95 74.7s is legitimately slow) and fell
-# to rank 13 behind eleven n=1 models sitting at exactly 50.0. max_candidates=8
+# to rank 13 behind eleven n=1 models sitting at exactly 50.0. The old
+# max_candidates=8 pre-router cap
 # then evicted it from the cascade: the one model PROVEN to do the job could no
 # longer be chosen for it.
 
@@ -789,7 +790,8 @@ def test_proven_model_is_not_evicted_by_unproven_ones(index):
         f"a proven, healthy, higher-tier model must outrank single-probe "
         f"newcomers; got {ranked[:3]}")
     assert proven in ranked[:8], (
-        "with max_candidates=8 the proven model must stay in the cascade")
+        "a proven model must sit in the head of the ranking that the main "
+        "cascade dials (max_attempts=8)")
 
 
 def test_thin_evidence_still_cannot_outrank_a_better_proven_model(index):

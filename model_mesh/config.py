@@ -123,19 +123,16 @@ DEFAULTS: dict = {
             "op_class": "retain",
             "include": [],
             "exclude": _NON_TEXT + ["reasoning"],
-            "max_candidates": 8,
         },
         "auto/consolidation": {
             "op_class": "consolidation",
             "include": [],
             "exclude": _NON_TEXT + ["reasoning"],
-            "max_candidates": 8,
         },
         "auto/reflect": {
             "op_class": "retain",
             "include": [],
             "exclude": _NON_TEXT + ["reasoning"],
-            "max_candidates": 8,
         },
         # Long-form prose/instruction-following lane (DSPy skill evolution).
         # Its OWN op_class on purpose: samples in `retain` drive hindsight's
@@ -144,7 +141,6 @@ DEFAULTS: dict = {
             "op_class": "evolve",
             "include": [],
             "exclude": _NON_TEXT,
-            "max_candidates": 8,
         },
     },
 }
