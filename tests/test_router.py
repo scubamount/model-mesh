@@ -581,6 +581,33 @@ def test_reprobed_true_only_after_a_probe_ran(index):
 
 # --- last-resort sweep arm ---------------------------------------------------
 
+def test_sweep_reaches_ineligible_when_floors_exclude_everything(index):
+    """Whole-pool episode shape (live-caught 2026-08-24): every candidate
+    fails its floors, ranked() returns [], and the request died in 11ms with
+    ZERO dials. The sweep's universe must be the full candidate list, not
+    just the ranked tail — trying beats refusing when everything is already
+    measured bad."""
+    # 4 all-fail samples each => below min_success_rate floor at
+    # min_samples_for_floor => ineligible for retain => ranked() == [].
+    for m in ("m1", "m2", "m3"):
+        for _ in range(4):
+            index.record(m, "retain", "probe", "http-500", 1000.0)
+    ok_body = {"choices": [{"message": {"content": '{"facts": ["x"]}'}}],
+               "model": "m1"}
+    script = {
+        # Every probe busy (else the re-probe arm rescues first); m1's sweep
+        # dial then pops the 200 and the SWEEP is the rescuer.
+        "m1": [(500, {}), (200, ok_body)],
+        "m2": [(500, {})],
+        "m3": [(500, {})],
+    }
+    router, t = make_router(index, script)
+    res = router.route(["m1", "m2", "m3"], {"messages": []}, "retain",
+                       probe_messages=PROBE)
+    assert res.ok and res.model_id == "m1" and res.swept
+    assert t.calls.count("m1") == 2      # probe(busy) + sweep dial(ok)
+
+
 def test_sweep_reaches_candidates_beyond_max_attempts(index):
     """2026-08-24 episode: 26-model pool, every ranked candidate failing. The
     main loop dials only ranked[:max_attempts]; ranks beyond it are never

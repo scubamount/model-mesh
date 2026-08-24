@@ -625,16 +625,27 @@ class Router:
                     )
                     return result
 
-        # Last-resort sweep. Both arms above only ever touch the top of the
-        # ranked list; this walks the rest. Dedupe against EVERY dial this
-        # request already made (main loop + re-probe retries): one failure is
-        # evidence enough and an upstream must never see two dials for one
-        # client call. 'gone' stays terminal — EOL'd ghosts are not candidates.
+        # Last-resort sweep. Both arms above only ever touch ELIGIBLE models:
+        # when the floors exclude everything (whole-pool episode), ranked()
+        # returns [] and a naive sweep would never run either — observed live
+        # 2026-08-24 as an 11ms 503 on auto/consolidation with zero dials.
+        # So the sweep's universe is the FULL candidate list: the ranked
+        # tail first, then every candidate the ranking excluded (ineligible
+        # floors, stale evidence) — a total miss means the floors' caution
+        # has bought nothing and trying beats refusing. Dedupe against EVERY
+        # dial this request already made (main loop + re-probe retries); one
+        # failure is evidence enough and an upstream must never see two
+        # dials for one client call. 'gone' stays terminal — EOL'd ghosts
+        # are not candidates.
         if self.cfg.sweep_on_total_miss and not result.ok:
             dialed = {a.model_id for a in result.attempts}
             swept_any = False
             swept_count = 0
-            for model_id in order[self.cfg.max_attempts:]:
+            seen = set(order)
+            sweep_order = order[self.cfg.max_attempts:] + [
+                m for m in candidates if m not in seen
+            ]
+            for model_id in sweep_order:
                 if swept_count >= self.cfg.sweep_max_models:
                     break
                 if model_id in dialed or self.index.breaker_get(

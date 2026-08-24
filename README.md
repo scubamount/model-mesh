@@ -169,10 +169,12 @@ Per request:
    This is the "if nothing works, ping again and find what's actually up
    right now" arm — it converts a stale-index total-miss into a recovery
    instead of an outage.
-5. **Still nothing → last-resort sweep**: walk the rest of the ranked pool
-   (ranks beyond the first cascade) and dial each directly — no probe
-   round-trip — skipping models this request already dialed and terminal
-   `gone` ghosts, until one serves or `total_budget_s` dies. This is what
+5. **Still nothing → last-resort sweep**: walk every remaining candidate —
+   the ranked tail first, then models the eligibility floors excluded
+   (when a whole-pool episode makes `ranked()` empty, trying beats
+   refusing) — dialing each directly with the real body, no probe
+   round-trip; skip models this request already dialed and terminal `gone`
+   ghosts; stop when one serves or `total_budget_s` dies. This is what
    makes "no healthy candidates" require a whole-pool failure inside a
    single request: hindsight retain/consolidation must fail only when every
    live NIM model actually failed within that request. (`sweep_on_total_miss`,
