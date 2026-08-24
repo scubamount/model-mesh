@@ -107,11 +107,11 @@ DEFAULTS: dict = {
     # scored for free.
     #
     # probe_top_n bounds it by RELEVANCE rather than by count: only the best few
-    # candidates per alias are probed at all. The cascade tries at most 3 models,
-    # so knowing the health of the 20th-best is worth nothing and costs a real
-    # request against a shared free endpoint. 6 leaves double the cascade depth
-    # in reserve, so several top models can be overloaded at once and a healthy,
-    # freshly-measured alternative is still ready.
+    # candidates per alias are probed at all. The main cascade dials at most
+    # max_attempts (8) and the sweep arm covers the rest, so knowing the health
+    # of the 20th-best is worth little and costs a real request against a
+    # shared free endpoint. 6 keeps freshly-measured alternatives ahead of the
+    # ranking while conserving quota.
     "discovery": {"max_probes_per_pass": 25, "probe_top_n": 6},
     # Non-text modalities and non-generative heads. EXCLUSION-first on purpose:
     # an include-whitelist of families matched 5 of 102 live NIM models and

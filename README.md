@@ -29,42 +29,43 @@ back to one of those four failures.**
 client (hindsight / hermes / opencode)
    │  POST /v1/chat/completions  model=auto/retain
    ▼
-┌─────────────────────────────────────────────┐
-│ model-mesh daemon (localhost only)          │
-│                                             │
-│  resolve alias → ranked candidate list      │
-│    (quality tier + availability, breaker)   │
-│  try #1 ──fail──▶ try #2 ──fail──▶ try #3   │
-│    │                                        │
-│    ├── all failed? LIVE RE-PROBE the pool,  │
-│    │   rebuild ranking, one more cascade;   │
-│    └── still failed? SWEEP the rest of the  │
-│        ranked pool (deduped, budget-bound); │
-│        only then 503 (with models_tried)    │
-│                                             │
-│  every real request updates the index       │
-│  (latency, status) — traffic IS telemetry   │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ model-mesh daemon (localhost only)           │
+│                                              │
+│  raw candidate pool → route() ranks once     │
+│  ARM 1: dial ranked[:max_attempts],          │
+│         budget-bounded (total_budget_s)      │
+│  ARM 2: live re-probe (time-boxed 25%),      │
+│         re-dial what answers                 │
+│  ARM 3: sweep every remaining candidate      │
+│         incl. floors-excluded, deduped       │
+│  only then 503 (with models_tried evidence)  │
+│                                              │
+│  every real request updates the index        │
+│  (latency, status) — traffic IS telemetry    │
+└──────────────────────────────────────────────┘
    │ upstream: NIM cloud (more providers later)
    ▼
-┌─────────────────────────────────────────────┐
-│ model index (SQLite, ~/.model-mesh/mesh.db) │
-│  catalog snapshots · probe+request history  │
-│  latency/jitter/spike/success · breakers    │
-│  · EOL log                                  │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ model index (SQLite mesh.db, state dir)      │
+│  catalog snapshots · probe+request history   │
+│  latency/jitter/spike/success · breakers     │
+│  · EOL log                                   │
+└──────────────────────────────────────────────┘
 ```
 
 ### The model index (the durable part)
 
-SQLite at `~/.model-mesh/mesh.db`. Tables:
+SQLite `mesh.db` in the mesh's **state directory** — the location ships as
+`db_path` in `model_mesh/config.py` and every artifact below (db, daemon log,
+discovery log, audit JSONL) lives under that same one directory. Tables:
 
 - `models` — every model ever seen in a catalog sync: id, provider,
   first_seen, last_seen, eol_at (when it vanished or started returning
-  410/404), metadata. Models are never deleted — EOL is data.
+  410/404). Models are never deleted — EOL is data.
 - `samples` — every probe AND every real request: model, ts, op_class,
-  latency_ms, status (http code or timeout/parse-fail), payload_chars.
-  Real traffic is the best probe; we log it for free.
+  latency_ms, status, payload_chars. Real traffic is the best probe; we log
+  it for free.
 - `breaker` — current circuit state per model (healthy / down / recovering /
   auth / gone), consecutive fails, cooldown_until.
 
@@ -89,105 +90,90 @@ Take the best model that is actually up right now. Deterministic — same
 evidence, same order, every call. `unknown` outranks `failing`: a model with no
 evidence is a maybe, and a maybe beats one measured broken.
 
+Two rules locked in by a measured failure (2026-08-09: all 23 scored retain
+models fell inside [49.9, 50.0] under a blended stability float, and ordering
+degenerated to the alphabetical tiebreak):
+
+- There is deliberately **no aggregate score** — `Score` carries p95, jitter,
+  spike rate and success rate and nothing sortable. Anything that reduces them
+  to one number re-creates both failures: it ranks availability while looking
+  like quality, and loses resolution the moment a prior or cap stabilizes it.
+- **Tell worth keeping: alphabetical order in `ranking_all` means nothing is
+  actually scored.**
+
 **Latency is an overload signal, not a quality measure.** On a shared free
 endpoint a slow response is not a property of the model, it is other people
-using it — and the model answering in 44s is the one about to start timing out.
-Past `overload_p95_ms` (20s) a model drops below everything healthy whatever its
-tier, and is promoted back for free when its measured p95 recovers. Nothing
-marks or unmarks it.
+using it. Past `overload_p95_ms` (20s) a model drops below everything healthy
+whatever its tier, and is promoted back for free when its p95 recovers.
+Nothing marks or unmarks it.
 
 **Quality tier** (1–5) is derived from the model id: parameter count, else a
 size adjective, else mid. That deliberately contradicts this codebase's rule
 against guessing capability from names, and the tension resolves on *which*
-question. "Can this model do the job?" is measurable, so it is measured by the
-fidelity probe and never guessed. "Is this model stronger?" is not measurable by
-any probe here — a latency probe cannot tell a 550b from a 1b except by the 1b
-winning, which is the exact inversion being fixed. Tiers are derived from the
-live catalog (new models tier on arrival, no edit), are a prior rather than a
-verdict (a top-tier model that is down loses to a healthy lower tier), and are
-overridable per model id via `router.tier_overrides`.
+question. "Can this model do the job?" is measurable — the fidelity gate
+measures it, never guesses. "Is this model stronger?" is not measurable by any
+probe here. Tiers derive from the live catalog (new models tier on arrival, no
+edit), are a prior rather than a verdict, and are overridable per model id via
+`router.tier_overrides`. Unknown sizes tier **mid, never bottom**.
 
-Unknown sizes tier **mid, never bottom** — `glm-5.2` and `minimax-m3` publish no
-parameter count and are frontier models; tiering them last would quietly exclude
-exactly what we want.
+### Eligibility floors (who may serve an op_class at all)
 
-<details>
-<summary>Superseded: the blended stability score (removed 2026-08-09)</summary>
+Before ranking, a model must pass per-op_class floors — all measured, none
+guessed:
 
-Ranking was one float over a 24h window:
+- **Fidelity gate**: a 200 whose body violates the op_class JSON contract is
+  recorded as `fidelity-fail` (a FAILED sample, never a success) and never
+  returned to the client. Two unrebutted violations drop the model from that
+  op_class (`fidelity_fails_for_floor`) until one success intervenes or the
+  weekly recheck elapses.
+- **Capability reject**: HTTP 400/413/422 means the provider parsed and
+  refused the request shape — deterministic, retry pointless. Excluded from
+  the op_class after two occurrences; the model stays eligible for others.
+- **Success floor**: below `min_success_rate` (0.5) over `min_samples_for_floor`
+  (4) in-window samples, a model does not serve that op_class.
+- **Latency floor**: measured p95 above `max_p95_ms_for_eligibility` (75s)
+  excludes the model — an attempt must be able to run twice inside the budget.
 
-```
-score = 0.30 * p95_latency + 0.30 * jitter + 0.20 * spike_rate + 0.20 * success_rate
-```
+Floors are caution, not verdicts: when they exclude everything, the sweep arm
+(arm 3 below) still tries them, because a total miss means the caution already
+bought nothing.
 
-Every term measures availability; none measures quality, so a 1b model outranked
-a 120b whenever it answered faster — the wrong objective for a memory backbone.
+### Request-time routing: three arms, one budget
 
-It had also lost all resolution. Measured live on `auto/retain`: 23 scored
-models spanning p95 0.4s–44.3s, **every score inside [49.9, 50.0]**, because
-confidence shrinkage pinned thin evidence just below a neutral prior and floored
-proven models at it. Ordering fell through to the alphabetical tiebreak, and
-`gemma-4-31b-it` held rank 0 at p95 44.3s with jitter 4.77 and a falling success
-rate — visibly degrading, structurally unbeatable.
+Per request (`total_budget_s` = 280s whole-cascade deadline; per-attempt
+timeout shrinks to fit what's left; the budget ends the request, never an
+attempt count):
 
-A randomized exploration arm (`explore_rate`, 10%) was tried first and made the
-ranking corrigible without making it correct: challengers still gained evidence
-one sample at a time and stayed capped below the prior until n=8. It is gone.
+1. `route()` ranks the RAW candidate pool once — app.py hands it over
+   unfiltered and uncapped. A pre-router slice or pre-ranking is what made
+   "no healthy candidates" reachable with zero dials (fixed 2026-08-24);
+   ranking happens exactly once, inside the router.
+2. **Arm 1 — cascade**: dial ranked candidates in order (`max_attempts`, 8).
+   Transient failures (429/5xx/timeout/malformed) trip the breaker and move
+   on; fidelity-fails never end the cascade with a bad answer in hand.
+3. **Arm 2 — live re-probe**: if everything missed, ping the pool now (the
+   index may be stale; `down` AND `auth` models are re-testable — only
+   `gone` is terminal). Re-dial whatever answers. Time-boxed to at most 25%
+   of remaining budget so hung probes can't starve arm 3.
+4. **Arm 3 — last-resort sweep**: dial every remaining candidate directly —
+   ranked tail first, then models the eligibility floors excluded (a total
+   miss means trying beats refusing), deduped against every model this
+   request already dialed, skipping terminal ghosts, capped at
+   `sweep_max_models` (12). This is what makes "no healthy candidates"
+   require a whole-pool failure inside one request: hindsight retain must
+   fail only when every live NIM model verifiably failed within that
+   request.
+5. All arms missed → `503` with `models_tried` + per-model failure reasons —
+   an honest verdict backed by evidence, not a guess.
 
-**Tell worth keeping: alphabetical order in `ranking_all` means nothing is
-actually scored.**
-</details>
+Status-code discipline:
 
-`samples` still records p95/jitter/spike/success per (model, op_class) — those
-drive the availability bucket, the eligibility floors and the breakers. What
-changed is that they no longer pretend to rank quality.
-
-`Score` carries those measurements and **no aggregate**: there is deliberately
-no single number to sort by. The blended float was deleted from the code on
-2026-08-09 (not just from the ranking), so `/mesh/status` no longer returns a
-`score` field per model — read `p95_ms`, `success_rate`, `n`, and `rank_inputs`
-instead. Anything reducing those to one number re-creates both failures above:
-it will rank availability while looking like quality, and it will lose
-resolution as soon as a prior or a cap is added to stabilize it.
-
-### Request-time routing (the part nim-proxy never had)
-
-Per request:
-
-1. Resolve alias (`auto/retain` → ranked candidates for op_class `retain`).
-2. Skip models whose breaker is open (down/gone/auth) or cooling down.
-3. Try candidate #1. On transient failure (429, 5xx, timeout, malformed
-   JSON) → breaker counts it and the cascade moves to the next candidate.
-   A 200 whose body violates the op_class JSON contract is a
-   `fidelity-fail`: recorded as a failed sample (never a success), the
-   response is not returned to the client, the cascade continues, and two
-   unrebutted violations drop the model from that op_class until one
-   success intervenes or the weekly recheck elapses. The cascade ends on
-   TIME (`total_budget_s`), never on an attempt count.
-4. **All tried and failed → live re-probe**: hit `/v1/models` + 1-token pings
-   on the pool, rebuild ranking from fresh data, run ONE more cascade.
-   This is the "if nothing works, ping again and find what's actually up
-   right now" arm — it converts a stale-index total-miss into a recovery
-   instead of an outage.
-5. **Still nothing → last-resort sweep**: walk every remaining candidate —
-   the ranked tail first, then models the eligibility floors excluded
-   (when a whole-pool episode makes `ranked()` empty, trying beats
-   refusing) — dialing each directly with the real body, no probe
-   round-trip; skip models this request already dialed and terminal `gone`
-   ghosts; stop when one serves or `total_budget_s` dies. This is what
-   makes "no healthy candidates" require a whole-pool failure inside a
-   single request: hindsight retain/consolidation must fail only when every
-   live NIM model actually failed within that request. (`sweep_on_total_miss`,
-   capped at `sweep_max_models` dials; both mirrored in `config.py`.)
-6. Even the sweep missed → `503` with `models_tried` + per-model failure
-   reasons.
-
-Status-code discipline (learned from FCM):
-
-- `429 / 5xx / timeout / HTML-instead-of-JSON` → transient, cascade.
-- `401 / 403` → auth, mark separately, never poisons the breaker.
-- `404 / 410` → **gone**: mark `eol_at` in the index immediately. This is the
-  maverick lesson — EOL detection at request time, not next audit.
+| code | meaning | action |
+|---|---|---|
+| 429 / 5xx / timeout | transient overload | cascade onward |
+| 401 / 403 | auth | separate state, expires; never poisons the breaker |
+| 400 / 413 / 422 | capability reject | excluded from that op_class |
+| 404 / 410 | **gone** | `eol_at` marked immediately — EOL detection at request time |
 
 ### Circuit breaker
 
@@ -202,113 +188,122 @@ cooldown (cap 30 min).
   index. New models → probed once per op_class, enter ranking if they pass
   fidelity. Vanished models → `eol_at` set, breaker `gone`. Log line per
   change: `NEW nvidia/x-9b`, `EOL meta/maverick`.
-- **Fidelity gate** per op_class before a model may serve it (inherited from
-  nim-proxy's ranker, kept verbatim in spirit): retain/consolidation demand
-  strict-JSON output of the expected shape; a tool-call probe validates
-  `tool_calls` for op-classes that need it.
+  The upstream listing is the candidate universe, not proof of service:
+  NIM keeps retired models listed while their endpoint hard-404s (measured
+  2026-08-24: 102 listed vs ~67 serving; 6/6 sampled ghost ids returned
+  instant 404s). Request-time evidence and `eol_at` are the truth.
 - **Representative probes**: probe payload is padded to the op_class's real
   size (retain ≈ 12k chars). A probe that can't fail like production fails
   is worse than no probe.
-- **Background probe cadence** only for models with no recent traffic
-  (default: skip if a real sample landed in the last 10 min — traffic is
-  telemetry, don't burn quota double-checking it).
+- **Background probe cadence** only for models with no recent traffic —
+  traffic is telemetry; don't burn quota double-checking it.
 
-**Probe economy.** Probing is not free: every probe is a real request against a
-shared free endpoint, and the quota it spends is the quota a newly-released
-model needs. Two bounds, both from what probing is actually *for* — detecting
-overload and disappearance, the only two things that change unpredictably:
+**Probe economy.** Probing is not free: every probe spends quota on a shared
+free endpoint. Two bounds, both derived from what probing is actually *for* —
+detecting overload and disappearance, the only two things that change
+unpredictably:
 
-- `discovery.probe_top_n` (default 6) — probe only the best few candidates per
-  alias, ordered by quality tier. The cascade tries at most 3 models, so the
-  health of the 20th-best is worth nothing while costing a real request.
-  Set to `null` to probe the whole pool.
-- `DORMANT_AFTER_S` (7 days) — a model with no successful request in a week is
-  treated as retired even while the catalog still lists it. NIM lists models it
-  will not serve: measured 17 of 18 models retired on request-time 404s were
-  still in the catalog, so catalog presence cannot answer "is this real". It is
-  a skip, not an EOL — one probe still runs per window, and a single success
-  clears dormancy with no separate resurrection path to maintain.
+- `discovery.probe_top_n` (default 6) — probe only the best few candidates
+  per alias, ordered by quality tier. `null` probes the whole pool.
+- `discovery.max_probes_per_pass` (default 25) — hard ceiling per pass.
+- `DORMANT_AFTER_S` (7 days) — no success across a full window ⇒ skip
+  probing that model (it is almost certainly retired; measured mid-episode
+  2026-08-24: all 35 retired ids were still catalog-listed). The skip is
+  window-keyed: one recheck probe still runs per window, and any real
+  success clears dormancy immediately — no separate resurrection path.
 
 ### API surface
 
 - `POST /v1/chat/completions` — OpenAI-compatible; `model` = alias or raw id.
+  On total failure: 503 with `models_tried` (per-attempt model/status/latency
+  evidence) and `reprobed`.
 - `GET /v1/models` — upstream catalog passthrough + aliases.
-- `GET /mesh/status` — ranking, breaker states, last sync, per-alias health.
-  Includes `rank_inputs` (quality tier + availability bucket per ranked model),
-  so the ordering is explainable from the response alone — the previous ranking
-  failure was invisible precisely because status showed an order with no way to
-  see the reason for it.
+- `GET /mesh/status` — per alias: pool size, ranking, **`ranking_all`** (full
+  ordering — a consumer must be able to tell "ranked 13th" from "not ranked
+  at all"), `scores` (p95_ms, success_rate, n — deliberately no aggregate),
+  `rank_inputs` (quality tier + availability bucket per ranked model), breaker
+  states. The ordering is explainable from the response alone.
 - `GET /mesh/models` — the live upstream catalog (`live`, `count`) plus current
-  `breaker` state per model. Per-model measurements and ranking live on
-  `/mesh/status`, not here.
-- `POST /mesh/probe` — force a re-probe (used by cron; rate-limited).
-- `GET /mesh/discovery` — recent discovery `runs`: timestamp, duration, and the
-  `new` / `eol` / `returned` / `probed` sets per pass. This is the churn record
-  the whole probe design exists for — it shows models arriving and vanishing
-  from the free catalog without any log grepping.
+  `breaker` state per model. Per-model measurements live on `/mesh/status`.
+- `POST /mesh/probe` — force a discovery pass now; returns the same
+  new/eol/probed report as the daily job. Discovers and fidelity-tests models;
+  it does not score them — scores backfill from real traffic.
+- `GET /mesh/discovery` — recent discovery runs: timestamp, duration, and the
+  `new`/`eol`/`returned`/`probed` sets per pass. The churn record the whole
+  probe design exists for.
 - `GET /health` — **deep** health: catalog reachable AND ≥1 healthy model per
   configured alias. Returns 503 otherwise. (The predecessor's `/health`
   could not fail while retain was down; this one can.)
 
 ### Config
 
-`~/.model-mesh/config.yaml` — providers (base URL + key env var), aliases →
-op_class + candidate filters (include/exclude patterns — the pool is
-discovered, not enumerated), breaker/probe tunables. Secrets stay in env,
-never in the DB or config. Defaults ship in `model_mesh/config.py`, so the
-daemon boots with no config file at all — and currently does: there is no
-`config.yaml` on this machine, every value below is the shipped default.
+The optional `config.yaml` (same state directory) is currently absent on this
+machine: every default below ships in `model_mesh/config.py` and the daemon
+boots with no config file. Aliases carry op_class + include/exclude patterns
+only (the pool is discovered, not enumerated); secrets stay in env, never in
+the DB or config.
 
-Ranking/probe knobs worth knowing:
+Router knobs worth knowing:
 
 | key | default | meaning |
 |---|---|---|
-| `router.overload_p95_ms` | `20000` | above this p95, a model is treated as overloaded and demoted below everything healthy |
-| `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the parameter-count heuristic misjudges a model |
-| `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` probes the whole pool |
-| `discovery.max_probes_per_pass` | `25` | hard ceiling on probes in one pass |
+| `router.max_attempts` | `8` | ranked candidates arm 1 dials before arm 2 |
+| `router.reprobe_top_n` | `4` | passes of live probing in arm 2 |
+| `router.sweep_on_total_miss` | `true` | enable arm 3 |
+| `router.sweep_max_models` | `12` | max direct dials in arm 3 |
+| `router.total_budget_s` | `280` | whole-cascade deadline (< hindsight's 300s) |
+| `router.request_timeout_s` | `90` | price of one hung attempt |
+| `router.overload_p95_ms` | `20000` | p95 at/above this = overloaded → demoted |
+| `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the size heuristic misjudges |
+| `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
+| `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
 
 ## Compatibility
 
 Drop-in for the nim-proxy contract hindsight speaks: `openai/auto/retain`,
-`auto/consolidation`, `auto/reflect` aliases on an OpenAI-compatible localhost
-port.
+`auto/consolidation`, `auto/reflect`, `auto/evolve` aliases on an
+OpenAI-compatible localhost port.
 
-**Cutover is done.** Hindsight's profile (`~/.hindsight/profiles/hermes.env`)
-points every LLM base URL at `http://127.0.0.1:8002/v1` — retain, reflect and
-consolidation, each with a litellm fallback to a pinned `openai/gpt-oss-20b` on
-the same port. nim-proxy on `:8001` no longer serves this path.
+**Cutover is done.** Hindsight's profile points every LLM base URL at
+`http://127.0.0.1:8002/v1` — retain, reflect, consolidation and evolution
+traffic all flow through the mesh, with a litellm fallback tier to a pinned
+`openai/gpt-oss-20b` on the same port.
 
 `auto/evolve` serves DSPy skill evolution (hermes-agent-self-evolution) on its
-own `evolve` op_class. Separate op_class, not a reuse of `retain`: scores are
-per-op_class, so evolution traffic must not vote in the ranking that picks
-hindsight's memory models.
+own `evolve` op_class — scores are per-op_class, so evolution traffic must not
+vote in the ranking that picks hindsight's memory models.
 
 ## Non-goals (v1)
 
-- Multi-provider fan-out (NIM only; the provider abstraction exists, the
-  catalog sync is per-provider, but only NIM ships enabled).
-- TUI/dashboard (FCM's core surface — ours is headless; `mesh/status` is JSON).
+- Multi-provider fan-out (NIM only by design; the provider abstraction exists,
+  catalog sync is per-provider).
+- TUI/dashboard — headless; `/mesh/status` is JSON.
 - Token accounting / billing.
 
 ## Ops
 
 - `scripts/install-launchd.sh` — daemon + daily discovery job. launchd labels:
-  `com.scubamount.model-mesh` (daemon) and `com.scubamount.model-mesh-discover`.
+  `com.scubamount.model-mesh` (daemon, KeepAlive) and
+  `com.scubamount.model-mesh-discover` (06:15 daily). Restart after code
+  changes: `launchctl kickstart -k gui/$(id -u)/com.scubamount.model-mesh`.
 - Runs on `127.0.0.1:8002`.
-- Logs: `~/.model-mesh/mesh.log` (daemon), audit JSONL `~/.model-mesh/audit/`.
-- State: everything under `~/.model-mesh/` — copy the dir, keep the history
-  (portable to other machines by design).
-- **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
-  EOL marks accumulated from real traffic, reconstructible only by re-living
-  that time. It is not in git and nothing here regenerates it. It is backed up
-  by `scripts/backup-durable-state.sh` in `hermes-agent-patches` (sqlite
-  `.backup`, WAL-safe — a plain `cp` of a WAL-mode db in use can capture a torn
-  page), which runs as an `/aaa` step and is gated by the
-  `durable-state-backed-up` invariant on backup *freshness*, not on the script
-  existing. A running daemon is not a backup: uptime reads as safety, which is
-  why this had none for months.
+- Logs: daemon log, discovery log, and audit JSONL — all under the state
+  directory (see `db_path` in `model_mesh/config.py`).
+- Tests: `.venv/bin/python -m pytest tests/` (131 tests; includes a sabotage
+  matrix proving each routing guarantee fails loudly when its mechanism is
+  removed).
+- State: everything under the state directory — copy the dir, keep the
+  history (portable to other machines by design).
+- **Backups.** `mesh.db` is *learned* state: sample history, breaker states
+  and EOL marks accumulated from real traffic, reconstructible only by
+  re-living that time. It is not in git and nothing here regenerates it. It
+  is backed up by the durable-state backup script in the hermes-agent-patches
+  repo (sqlite `.backup`, WAL-safe), which runs as an `/aaa` step gated by a
+  backup-*freshness* invariant. A running daemon is not a backup: uptime
+  reads as safety, which is why this had none for months.
 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+
