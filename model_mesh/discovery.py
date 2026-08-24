@@ -136,11 +136,13 @@ def discover(
     request against a shared free endpoint. Ordering is by quality tier, so the
     models kept warm are the ones worth having.
 
-    `dormant_after_s` skips models that have failed every attempt for this long.
-    NIM retires models without removing them from the catalog, so `live` is not
-    the same as `servable`; without this, a model that 404s forever is re-probed
-    on every pass forever. It is a SKIP, not an EOL — one probe still runs after
-    the dormancy window so a genuinely returning model comes back on its own.
+    `dormant_after_s` skips models that have had zero successes across every
+    attempt in this window. NIM retires models without removing them from the
+    catalog, so `live` is not the same as `servable`; without this, a model
+    that 404s forever is re-probed on every pass forever. The skip is keyed to
+    the window, not to "has ever been dormant": once the last attempt ages out
+    of the window exactly one recheck probe runs per window after that, and a
+    single success clears dormancy outright — never a one-way door.
 
     `stale_after_s` must track Index.score()'s window and land STRICTLY INSIDE
     it (SCORE_WINDOW_S * REFRESH_MARGIN — see the constant for the incident).
@@ -214,11 +216,26 @@ def discover(
                 # nothing at all.
                 if index.last_sample_ts(mid, oc) > stale_cutoff:
                     continue  # evidence still inside the scoring window
-                # Long-dead model: listed in the catalog but not serving. Skip
-                # until the dormancy window elapses, then allow exactly one
-                # probe — a model that has come back rebuts its own dormancy
-                # with a single success, so this can never be a one-way door.
-                if index.dormant_since(mid, dormant_after_s) is not None:
+                # Dormant gate. "Dormant" = tried within the dormancy window
+                # and had zero successes in it: every attempt we made recently
+                # failed, so the catalog listing is not evidence the model
+                # serves. Skip — but the skip is keyed to the WINDOW, not to
+                # the model having EVER been dormant. Gating on
+                # `dormant_since() is not None` was a silent third ratchet
+                # (found in audit 2026-08-24): the flag only clears via a
+                # fresh success, only a probe can produce one, and the probe
+                # was the thing being skipped — so a once-dormant lane was
+                # unprobed FOREVER, contradicting this constant's own contract
+                # of one recheck per window. Keyed to the window, the weekly
+                # recheck emerges for free: each probe writes a sample, which
+                # suppresses the next probe until the window elapses again,
+                # and one success clears dormancy outright (self-rebutting).
+                last_ts = index.last_sample_ts(mid, oc)
+                ok_ts = index.last_success_ts(mid, oc)
+                now = time.time()
+                tried_recently = last_ts > 0.0 and (now - last_ts) < dormant_after_s
+                worked_recently = ok_ts > 0.0 and (now - ok_ts) < dormant_after_s
+                if tried_recently and not worked_recently:
                     if mid not in dormant_skipped:
                         dormant_skipped.append(mid)
                     continue

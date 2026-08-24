@@ -155,7 +155,13 @@ Per request:
 1. Resolve alias (`auto/retain` → ranked candidates for op_class `retain`).
 2. Skip models whose breaker is open (down/gone/auth) or cooling down.
 3. Try candidate #1. On transient failure (429, 5xx, timeout, malformed
-   JSON) → breaker counts it, cascade to #2, then #3 (`max_attempts`, default 3).
+   JSON) → breaker counts it and the cascade moves to the next candidate.
+   A 200 whose body violates the op_class JSON contract is a
+   `fidelity-fail`: recorded as a failed sample (never a success), the
+   response is not returned to the client, the cascade continues, and two
+   unrebutted violations drop the model from that op_class until one
+   success intervenes or the weekly recheck elapses. The cascade ends on
+   TIME (`total_budget_s`), never on an attempt count.
 4. **All tried and failed → live re-probe**: hit `/v1/models` + 1-token pings
    on the top pool, rebuild ranking from fresh data, run ONE more cascade.
    This is the "if nothing works, ping again and find what's actually up

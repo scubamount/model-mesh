@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .index import Index, OK
+from .index import FIDELITY_FAIL_STATUS, Index, OK
 from .opclass import check_fidelity
 from .quality import rank_key
 
@@ -84,6 +84,14 @@ class RouterConfig:
     # http-400 = deterministic payload rejection) but 100% on consolidation.
     min_success_rate: float = 0.5
     min_samples_for_floor: int = 4
+    # Consecutive fidelity violations (an upstream 200 whose body violates the
+    # op_class JSON contract) that drop a model from an op_class until the
+    # recheck window elapses or one success intervenes. One strike is not a
+    # verdict — the cascade absorbs it and the client was served — but two
+    # unrebutted is the settled signal an http reject is. Mirrored in
+    # config.py DEFAULTS["router"]; test_config_defaults_match_dataclass
+    # asserts the two stay in sync.
+    fidelity_fails_for_floor: int = 2
     # Absolute-failure gate for the thin-evidence arm of the success floor,
     # used only below min_samples_for_floor. 2 = "failed twice", which no
     # amount of missing samples explains away.
@@ -227,6 +235,16 @@ class Router:
             # eligible=True and burned a cascade slot on every memory op.
             if self.index.unrebutted_reject(model_id, op_class) is not None:
                 return False
+            # Fidelity floor, sibling of the reject floor above. An http reject
+            # is deterministic; a broken-JSON/empty-content 200 is usually
+            # stochastic, so ONE violation is not a verdict (the cascade
+            # already absorbed it). `fidelity_fails_for_floor` consecutive
+            # violations with no intervening success IS settled evidence, and
+            # the same REJECT_RECHECK_S window buys the weekly retry.
+            if self.index.unrebutted_fidelity_fails(
+                model_id, op_class, need=self.cfg.fidelity_fails_for_floor,
+            ) is not None:
+                return False
             s = self.index.score(model_id, op_class)
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
@@ -324,6 +342,28 @@ class Router:
         ms = (time.monotonic() - t0) * 1000.0
 
         if status_code == 200:
+            # Fidelity gate, enforced at the ONE place every response passes.
+            # It used to run only inside probe_verdict, and the 200 below was
+            # recorded as `ok` BEFORE any check — so a prose-leaking model
+            # accrued success_rate=1.0, topped the ranking, and served real
+            # memory traffic output hindsight cannot parse (audit 2026-08-24).
+            # The response still RETURNS here: this cascade already paid for
+            # it, and refusing it would spend another full upstream call. What
+            # changes is the evidence — the sample reads fidelity-fail, so the
+            # success-rate floor demotes the model and two violations without
+            # an intervening success drop it from the cascade entirely
+            # (_eligible / unrebutted_fidelity_fails).
+            ok, why = check_fidelity(payload, op_class)
+            if not ok:
+                self.index.record(model_id, op_class, source,
+                                  FIDELITY_FAIL_STATUS, ms, payload_chars,
+                                  request_id=request_id)
+                logger.warning(
+                    "fidelity-fail model=%s op_class=%s source=%s "
+                    "payload_chars=%d why=%s",
+                    model_id, op_class, source, payload_chars, why,
+                )
+                return payload, Attempt(model_id, FIDELITY_FAIL_STATUS, ms, why)
             self.index.record(model_id, op_class, source, OK, ms, payload_chars,
                               request_id=request_id)
             self._on_success(model_id)
@@ -453,6 +493,14 @@ class Router:
             status = str(att.status or "")
             if status in ("http-404", "http-410"):
                 return "unusable", f"not servable ({status})"
+            # The fidelity gate inside _call already classified a
+            # broken-JSON/empty-content 200 as FIDELITY_FAIL_STATUS and
+            # recorded the sample — a capability signal, same family as an
+            # http reject, never "busy" (the pre-gate behaviour here called
+            # these unusable via its own check; the gate moved upstream, so
+            # the verdict must follow the sample, not re-derive it).
+            if status == FIDELITY_FAIL_STATUS:
+                return "rejected", f"fidelity: {str(att.detail or '')[:120]}"
             # A 4xx reject is a CAPABILITY verdict, not overload: the provider
             # parsed the request and refused it, so re-probing produces the
             # identical answer. Calling it `busy` (the pre-2026-08-08 behaviour)
@@ -466,8 +514,10 @@ class Router:
                 return "rejected", f"{status}: {str(att.detail or '')[:120]}"
             return "busy", f"{status}: {str(att.detail or '')[:120]}"
 
-        ok, why = check_fidelity(payload, op_class)
-        return ("pass", "") if ok else ("unusable", why)
+        # A 200 that reaches this line already passed the fidelity gate inside
+        # _call — re-running check_fidelity here would re-derive a decision
+        # the sample log already holds (and could disagree with it).
+        return "pass", ""
 
     # -- the cascade ---------------------------------------------------------
 
@@ -488,6 +538,22 @@ class Router:
         def _remaining() -> float:
             return deadline - time.monotonic()
 
+        def _dial(mid: str, source: str) -> tuple[bool, Attempt, Optional[dict]]:
+            """One upstream call that counts only if the body is usable.
+            Fidelity failures return a payload but must not end the cascade:
+            the client would receive output its own parser rejects. This one
+            predicate is the whole cascade — main loop and re-probe retries
+            share it, so neither arm can drift into accepting prose."""
+            payload, att = self._call(
+                mid, body, op_class, source=source,
+                timeout=min(self.cfg.request_timeout_s, _remaining()),
+                request_id=request_id,
+            )
+            result.attempts.append(att)   # telemetry: EVERY dial is recorded
+            if payload is not None and att.status == OK:
+                return True, att, payload
+            return False, att, None
+
         order = self.ranked(candidates, op_class)
         for model_id in order[: self.cfg.max_attempts]:
             left = _remaining()
@@ -497,21 +563,18 @@ class Router:
                             "cascade budget exhausted")
                 )
                 break
-            # Shrink the per-attempt timeout to what's left so the cascade never
-            # overruns the client's own timeout mid-failover.
-            payload, att = self._call(
-                model_id, body, op_class, source="request",
-                timeout=min(self.cfg.request_timeout_s, left),
-                request_id=request_id,
-            )
-            result.attempts.append(att)
-            if payload is not None:
-                result.ok, result.model_id, result.response = True, model_id, payload
+            ok, att, payload = _dial(model_id, "request")
+            if ok:
+                result.ok, result.model_id, result.response = (
+                    True, model_id, payload,
+                )
                 return result
 
         # Total miss -> the re-probe arm. The index may be stale (models EOL'd,
         # provider-side incident cleared); measure NOW and try once more.
-        result.reprobed = True
+        # `reprobed` means a probe RAN — set only after the loop proves it,
+        # never speculatively: a budget exhausted before the first probe must
+        # not report work it did not do (audit 2026-08-24).
         if probe_messages:
             fresh: list[str] = []
             for model_id in candidates:
@@ -526,17 +589,18 @@ class Router:
                 if self.probe(model_id, op_class, probe_messages,
                               timeout=min(self.cfg.probe_timeout_s, _remaining())):
                     fresh.append(model_id)
+            reprobed_any = bool(fresh)
             for model_id in fresh:
                 left = _remaining()
                 if left <= 1.0:
-                    break
-                payload, att = self._call(
-                    model_id, body, op_class, source="request",
-                    timeout=min(self.cfg.request_timeout_s, left),
-                    request_id=request_id,
-                )
-                result.attempts.append(att)
-                if payload is not None:
+                    result.attempts.append(
+                        Attempt(model_id, "skipped-budget", None,
+                                "cascade budget exhausted")
+                    )
+                    continue
+                ok, att, payload = _dial(model_id, "request")
+                if ok:
+                    result.reprobed = reprobed_any
                     result.ok, result.model_id, result.response = (
                         True, model_id, payload,
                     )

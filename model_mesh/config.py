@@ -70,6 +70,11 @@ DEFAULTS: dict = {
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
         "min_failures_for_thin_floor": 2,
+        # Consecutive fidelity violations (200 with a body violating the
+        # op_class JSON contract) that drop a model from an op_class. Must
+        # match RouterConfig.fidelity_fails_for_floor; the defaults-match test
+        # asserts the two files agree.
+        "fidelity_fails_for_floor": 2,
         # Must satisfy 2 * this < total_budget_s so a slow model can't consume
         # the cascade; audit-timeout-chain.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,

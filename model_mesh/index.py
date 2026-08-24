@@ -75,6 +75,15 @@ CONFIDENT_N = 8
 # reverse) and duplicating the set silently is how these drift.
 REJECT_STATUSES = ("http-400", "http-413", "http-422")
 
+# Status recorded INSTEAD OF ok when an upstream 200 violates the op_class
+# fidelity contract (empty content, non-JSON prose leak). The response reached
+# us, so the model is up — but a memory backbone cannot consume prose, and
+# counting it as a success taught the ranking that the worst-behaved model was
+# the best one. Recorded as a failed sample so every existing floor sees it;
+# gated separately in Router._eligible because, unlike an http reject, a
+# fidelity failure can be stochastic and deserves its own evidence rule.
+FIDELITY_FAIL_STATUS = "fidelity-fail"
+
 # How long an unrebutted capability rejection excludes a model from an op_class
 # before one retry is admitted. Mirrors EOL_RECHECK_S: a reject is strong
 # evidence but never permanent, because NIM changes what it serves.
@@ -272,45 +281,15 @@ class Index:
             ).fetchone()
         return row[0] or 0.0
 
-    def dormant_since(
-        self, model_id: str, dormant_after_s: float
-    ) -> Optional[float]:
-        """Timestamp of the last success, when a model has failed ever since.
-
-        Returns None if the model succeeded within `dormant_after_s`, or has no
-        samples at all (never tried is not dormant — it is unknown, and unknown
-        is exactly what discovery exists to resolve).
-
-        NIM lists models it will not actually serve: measured 2026-08-09, 17 of
-        18 models the index had EOL'd on request-time 404s were still present in
-        the catalog. Catalog presence therefore cannot answer "is this model
-        real", and without a dormancy test every one of those is re-probed on
-        every pass forever — burning the probe budget that newly-released models
-        need, on models that have not served a request in weeks.
-
-        Deliberately reads the sample log rather than a flag: a model that
-        starts working again rebuts its own dormancy the moment one success
-        lands, with no separate resurrection path to maintain, and no state that
-        can disagree with the evidence.
-        """
+    def last_success_ts(self, model_id: str, op_class: str) -> float:
+        """Timestamp of the newest `ok` sample for (model, op_class); 0.0 if none."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT MAX(CASE WHEN status=? THEN ts END), MAX(ts)"
-                " FROM samples WHERE model_id=?",
-                (OK, model_id),
+                "SELECT MAX(ts) FROM samples WHERE model_id=? AND op_class=?"
+                " AND status=?",
+                (model_id, op_class, OK),
             ).fetchone()
-        if not row or row[1] is None:
-            return None  # never sampled: unknown, not dormant
-        last_ok, last_any = row
-        now = time.time()
-        if last_ok is None:
-            # Never once succeeded. Dormant only after the window has elapsed
-            # since we started trying, so a model discovered minutes ago is not
-            # written off before it has had a fair chance.
-            return last_any if (now - last_any) >= dormant_after_s else None
-        if (now - last_ok) >= dormant_after_s:
-            return last_ok
-        return None
+        return row[0] or 0.0
 
     def unrebutted_reject(
         self, model_id: str, op_class: str, recheck_s: float = REJECT_RECHECK_S
@@ -336,17 +315,46 @@ class Index:
         not a reject (any later success rebuts it), or when the reject is older
         than recheck_s — NIM changes what it serves, so this is never permanent.
         """
+        return self._latest_unrebutted(model_id, op_class, REJECT_STATUSES, recheck_s)
+
+    def unrebutted_fidelity_fails(
+        self, model_id: str, op_class: str, need: int = 2,
+        recheck_s: float = REJECT_RECHECK_S,
+    ) -> Optional[float]:
+        """Timestamp when the last `need` samples for an op_class ALL violated
+        the fidelity contract, provided no later success rebuts them.
+
+        Unlike an http reject, a fidelity failure is stochastic: a model may
+        leak prose once under load and comply the next minute. One strike must
+        not exile it (that is what the cascade is for — the client was already
+        served by the next candidate), but `need` consecutive violations with no
+        intervening success is the same deterministic signal an http reject is,
+        and the same recheck window applies.
+
+        This gate is what keeps a prose-leaking model OUT of the ranking during
+        that window; recording the failures as non-ok samples is what eventually
+        demotes it through the ordinary success-rate floor.
+        """
+        return self._latest_unrebutted(
+            model_id, op_class, (FIDELITY_FAIL_STATUS,), recheck_s, need=need
+        )
+
+    def _latest_unrebutted(
+        self, model_id: str, op_class: str, statuses: tuple,
+        recheck_s: float, need: int = 1,
+    ) -> Optional[float]:
+        """Shared engine for the unrebutted-* gates: the most recent `need`
+        samples for (model, op_class) are all in `statuses`, none older than
+        recheck_s -> timestamp of the newest such sample; else None."""
         with self._lock:
-            row = self._conn.execute(
+            rows = self._conn.execute(
                 "SELECT status, ts FROM samples WHERE model_id=? AND op_class=?"
-                " ORDER BY ts DESC LIMIT 1",
-                (model_id, op_class),
-            ).fetchone()
-        if not row:
+                " ORDER BY ts DESC LIMIT ?",
+                (model_id, op_class, need),
+            ).fetchall()
+        if len(rows) < need or any(r[0] not in statuses for r in rows):
             return None
-        status, ts = row
-        if status not in REJECT_STATUSES:
-            return None
+        ts = rows[0][1]  # newest of the run; rows ordered DESC
         if (time.time() - ts) >= recheck_s:
             return None  # stale: admit one retry
         return ts

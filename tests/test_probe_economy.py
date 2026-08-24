@@ -6,42 +6,44 @@ Two rules follow from what probing is FOR (detecting overload and disappearance,
 the only two things that change unpredictably):
 
   - a model the cascade would never dial has health worth knowing nothing about
-  - a model that has not served a request in a week is retired, whatever the
-    catalog still claims
+  - a model with zero successes across its attempts inside the dormancy window
+    is skipped, whatever the catalog still claims
 
-Both are bounded, self-rebutting, and reversible: a dormant model gets one probe
-per window, and a single success clears its dormancy with no separate
-resurrection path.
+The skip is keyed to the WINDOW, never to "has ever been dormant": gating on a
+dormant-flag made a once-dormant model unprobed FOREVER (audit 2026-08-24) —
+the flag only clears via a success, only a probe produces one, and the probe
+was the thing being skipped. Keyed to the window, the documented weekly
+recheck emerges for free and a single success clears dormancy outright.
+
+These were `check()`-decorated functions with their own main() that NOTHING
+invoked — pytest collected zero of them, so every guarantee below was
+decoration while the suite stayed green (audit 2026-08-24). They are plain
+pytest tests now.
 """
 
-import sys
+from __future__ import annotations
+
 import time
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import pytest
 
-from model_mesh.discovery import DORMANT_AFTER_S, discover  # noqa: E402
-from model_mesh.index import SCORE_WINDOW_S, Index, OK  # noqa: E402
-
-CHECKS = []
-
-
-def check(name):
-    def deco(fn):
-        CHECKS.append((name, fn))
-        return fn
-    return deco
+from model_mesh.discovery import DORMANT_AFTER_S, discover
+from model_mesh.index import SCORE_WINDOW_S, Index, OK
 
 
 class FakeRouter:
-    """Records what was probed. Never touches the network."""
+    """Records what was probed. A passing verdict writes the sample a real
+    router would — otherwise nothing ever marks a recheck as consumed."""
 
-    def __init__(self, verdict=("pass", "")):
+    def __init__(self, index: Index, verdict=("pass", "")):
+        self.index = index
         self.probed = []
         self._verdict = verdict
 
     def probe_verdict(self, mid, oc, messages, timeout=None):
         self.probed.append((mid, oc))
+        if self._verdict[0] == "pass":
+            self.index.record(mid, oc, "probe", OK, 900.0)
         return self._verdict
 
 
@@ -60,8 +62,9 @@ CATALOG = [
 ALIASES = {"auto/retain": {"op_class": "retain", "include": [], "exclude": []}}
 
 
-def _index(tmp) -> Index:
-    idx = Index(tmp / f"pe-{time.time_ns()}.db")
+@pytest.fixture()
+def index(tmp_path):
+    idx = Index(tmp_path / "pe.db")
     idx.sync_catalog("nim", set(CATALOG))
     return idx
 
@@ -76,121 +79,91 @@ def _run(idx, router, **kw):
     )
 
 
-@check("probe_top_n probes only the best few candidates, not the whole catalog")
-def t_top_n(tmp):
-    idx, r = _index(tmp), FakeRouter()
-    _run(idx, r, probe_top_n=3)
-    assert len(r.probed) == 3, r.probed
+def _seed_sample(idx, mid, status, age_s):
+    """Insert one aged sample the way the daemon would have written it."""
+    with idx._lock:
+        idx._conn.execute(
+            "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
+            " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
+            (mid, time.time() - age_s, "retain", "probe", None, status, None),
+        )
+        idx._conn.commit()
 
 
-@check("the few probed are the STRONGEST, not the alphabetically first")
-def t_top_n_picks_best(tmp):
+def test_probe_top_n_probes_only_the_best_few(index):
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=3)
+    assert len(router.probed) == 3, router.probed
+
+
+def test_the_few_probed_are_the_strongest_not_the_alphabetical_first(index):
     # Alphabetical ordering is what starved openai/* of probes for weeks.
-    idx, r = _index(tmp), FakeRouter()
-    _run(idx, r, probe_top_n=3)
-    probed = {m for m, _ in r.probed}
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=3)
+    probed = {m for m, _ in router.probed}
     assert "meta/llama-3.2-1b-instruct" not in probed, probed
     assert "nvidia/nemotron-3-ultra-550b-a55b" in probed, probed
 
 
-@check("probe_top_n=None keeps probing everything (opt-in, no silent change)")
-def t_top_n_optional(tmp):
-    idx, r = _index(tmp), FakeRouter()
-    _run(idx, r, probe_top_n=None)
-    assert len(r.probed) == len(CATALOG), len(r.probed)
+def test_probe_top_n_none_keeps_probing_everything(index):
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=None)
+    assert len(router.probed) == len(CATALOG), len(router.probed)
 
 
-@check("a model that has failed for a week is not probed again")
-def t_dormant_skipped(tmp):
-    idx, r = _index(tmp), FakeRouter()
-    dead = "openai/gpt-oss-120b"
-    old = time.time() - (DORMANT_AFTER_S + 3600)
-    with idx._lock:
-        for _ in range(4):
-            idx._conn.execute(
-                "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
-                " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
-                (dead, old, "retain", "probe", None, "http-404", None),
-            )
-        idx._conn.commit()
-    _run(idx, r, probe_top_n=None)
-    assert dead not in {m for m, _ in r.probed}, r.probed
-
-
-@check("a model that failed only recently IS still probed")
-def t_recent_failure_still_probed(tmp):
-    # Overload is temporary. Writing a model off after one bad hour is exactly
-    # the failure mode we are avoiding — a popular model must not be excluded
-    # for being popular.
-    #
-    # The failure must be aged past the SCORING window (else the staleness gate
-    # skips the probe for an unrelated and correct reason: evidence is fresh, so
-    # no probe is needed) but well inside the DORMANCY window. That gap is the
-    # whole point: stale-but-not-dormant is precisely the state that earns a
-    # re-probe.
-    idx, r = _index(tmp), FakeRouter()
+def test_zero_successes_inside_the_window_is_skipped(index):
+    # Failed two days ago, never succeeded: the catalog listing is not
+    # evidence the model serves. Probing it again today is exactly the burn
+    # the dormancy gate exists to stop.
     mid = "openai/gpt-oss-120b"
-    aged = time.time() - (SCORE_WINDOW_S + 3600)
-    assert aged > time.time() - DORMANT_AFTER_S, "fixture must not be dormant"
-    with idx._lock:
-        idx._conn.execute(
-            "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
-            " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
-            (mid, aged, "retain", "probe", None, "http-429", None),
-        )
-        idx._conn.commit()
-    _run(idx, r, probe_top_n=None)
-    assert mid in {m for m, _ in r.probed}, r.probed
+    _seed_sample(index, mid, "http-404", 2 * 86400)
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=None)
+    assert mid not in {m for m, _ in router.probed}, router.probed
 
 
-@check("one success clears dormancy — no separate resurrection path")
-def t_dormancy_self_rebuts(tmp):
-    idx = _index(tmp)
+def test_once_dormant_lane_is_rechecked_after_the_window_exactly_once(index):
+    """The audit 2026-08-24 ratchet. A model whose last attempt aged out of
+    the window MUST earn one recheck probe; that probe writes a sample, which
+    suppresses the next window. Under the dormant-flag gate this model was
+    never probed again — silently contradicting DORMANT_AFTER_S's contract."""
     mid = "openai/gpt-oss-120b"
-    old = time.time() - (DORMANT_AFTER_S + 3600)
-    with idx._lock:
-        idx._conn.execute(
-            "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
-            " status, payload_chars) VALUES (?,?,?,?,?,?,?)",
-            (mid, old, "retain", "probe", None, "http-404", None),
-        )
-        idx._conn.commit()
-    assert idx.dormant_since(mid, DORMANT_AFTER_S) is not None
-    idx.record(mid, "retain", "probe", OK, 900.0)
-    assert idx.dormant_since(mid, DORMANT_AFTER_S) is None
+    _seed_sample(index, mid, "http-404", DORMANT_AFTER_S + 3600)
+
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=None)
+    assert mid in {m for m, _ in router.probed}, (
+        f"once-dormant model was never re-probed — one-way door: {router.probed}"
+    )
+
+    # The recheck wrote a sample; the next pass must not re-probe it again.
+    router2 = FakeRouter(index)
+    _run(index, router2, probe_top_n=None)
+    assert mid not in {m for m, _ in router2.probed}, router2.probed
 
 
-@check("a never-sampled model is unknown, not dormant")
-def t_never_sampled_not_dormant(tmp):
-    idx = _index(tmp)
-    assert idx.dormant_since("openai/gpt-oss-120b", DORMANT_AFTER_S) is None
+def test_one_success_inside_the_window_rebutts_dormancy(index):
+    # Failure five days ago, success four days ago: the model came back, so
+    # the failures do not make it dormant. Stale enough to NEED a probe
+    # (outside the scoring window) yet inside the dormancy window WITH a
+    # success — precisely the state that must stay probed.
+    mid = "openai/gpt-oss-120b"
+    _seed_sample(index, mid, "http-500", 5 * 86400)
+    _seed_sample(index, mid, OK, 4 * 86400)
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=None)
+    assert mid in {m for m, _ in router.probed}, router.probed
 
 
-@check("FIXTURE CHECK: without top_n the fixture really does probe all 9")
-def t_fixture_not_vacuous(tmp):
-    # If the catalog fixture were empty or the router never called, every
-    # "probed fewer" assertion above would pass vacuously.
-    idx, r = _index(tmp), FakeRouter()
-    _run(idx, r)
-    assert len(r.probed) == 9, len(r.probed)
+def test_a_never_sampled_model_is_unknown_not_dormant(index):
+    router = FakeRouter(index)
+    _run(index, router, probe_top_n=None)
+    assert len(router.probed) == 9, router.probed
 
 
-def main():
-    import tempfile
-    passed = failed = 0
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        for name, fn in CHECKS:
-            try:
-                fn(tmp)
-                print(f"  PASS  {name}")
-                passed += 1
-            except Exception as e:  # noqa: BLE001
-                print(f"  FAIL  {name}: {type(e).__name__}: {e}")
-                failed += 1
-    print(f"\n{passed} passed, {failed} failed (of {len(CHECKS)})")
-    return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def test_scoring_window_and_dormancy_window_leave_a_probeable_gap():
+    """The staleness gate skips anything fresher than SCORE_WINDOW_S; the
+    dormancy gate skips anything tried within DORMANT_AFTER_S without success.
+    If the scoring window reached past the dormancy window, a failed model
+    would be 'fresh enough' forever and never rechecked."""
+    assert SCORE_WINDOW_S < DORMANT_AFTER_S

@@ -335,7 +335,7 @@ def test_cheap_rejects_do_not_exhaust_the_cascade(index):
     script: dict[str, list[tuple[int, dict]]] = {
         f"m{i}": [(400, {"detail": "bad payload"})] for i in range(1, 8)
     }
-    script["m8"] = [(200, {"choices": [{"message": {"content": "{}"}}]})]
+    script["m8"] = [(200, {"choices": [{"message": {"content": '{"facts": ["ok"]}'}}]})]
     router, t = make_router(index, script)
     res = router.route([f"m{i}" for i in range(1, 9)], {"messages": []}, "retain")
     assert res.ok and res.model_id == "m8", (
@@ -460,3 +460,109 @@ def test_transient_failure_is_logged(index, caplog):
     rec = [x for x in caplog.records if "transient" in x.getMessage()]
     assert rec, "a transient failure produced no log line"
     assert "overloaded" in rec[0].getMessage()
+
+
+# --- fidelity gate ------------------------------------------------------------
+# Audit 2026-08-24: check_fidelity ran only inside probe_verdict, while _call
+# recorded every upstream 200 as `ok` BEFORE any check. A prose-leaking model
+# therefore accrued success_rate=1.0, topped the ranking on quality tier, and
+# served real memory traffic output hindsight cannot parse.
+
+BAD_200 = (200, {"choices": [{"message": {"content": "Sure! Here are the facts:"}}]})
+
+def test_fidelity_fail_is_recorded_not_ok(index):
+    """A 200 that violates the JSON contract must never write an `ok` sample:
+    that taught the ranking the worst-behaved model was the best one."""
+    router, _ = make_router(index, {"m1": [BAD_200]})
+    res = router.route(["m1"], {"messages": []}, "retain")
+    s = index.score("m1", "retain")
+    assert s is not None and s.n == 1 and s.success_rate == 0.0, vars(s)
+    # Known-unparseable output is never returned as success: with no other
+    # candidate left, the client gets the 503 evidence path instead.
+    assert not res.ok and res.response is None
+    assert res.attempts[0].status == "fidelity-fail"
+
+
+def test_fidelity_fail_cascades_instead_of_serving_prose(index):
+    """A prose-leaking model must not END a cascade: the next candidate can
+    still serve parseable output. Names chosen so the leaker sorts FIRST —
+    ranked() breaks exact ties alphabetically, and a 'leak'/'good' pair let
+    the good model win attempt one, testing nothing."""
+    script = {
+        "a-leak": [BAD_200],
+        "b-good": [(200, {"choices": [
+            {"message": {"content": '{"facts": ["x"]}'}}]})],
+    }
+    router, _ = make_router(index, script)
+    res = router.route(["a-leak", "b-good"], {"messages": []}, "retain",
+                       probe_messages=PROBE)
+    assert res.ok and res.model_id == "b-good", (
+        f"a fidelity failure ended the cascade: {[vars(a) for a in res.attempts]}"
+    )
+    assert [a.status for a in res.attempts] == ["fidelity-fail", "ok"]
+
+
+def test_two_unrebutted_fidelity_fails_drop_model_from_ranking(index):
+    """Two consecutive contract violations with no success between them is the
+    settled signal an http reject is: the model leaves the cascade until the
+    recheck window elapses or a success intervenes."""
+    script = {"m-bad": [BAD_200] * 3}
+    router, t = make_router(index, script)
+    router.route(["m-bad"], {"messages": []}, "retain")   # strike 1
+    router.route(["m-bad"], {"messages": []}, "retain")   # strike 2
+    assert router.ranked(["m-bad", "m-alt"], "retain") == ["m-alt"]
+    # Recovery has two layers and both are real: ONE success clears the
+    # fidelity GATE (unrebutted run broken), and the ordinary success-rate
+    # floors re-admit the model once its measured rate earns it back.
+    index.record("m-bad", "retain", "probe", OK, 900.0)
+    for _ in range(2):
+        index.record("m-bad", "retain", "probe", OK, 900.0)
+    assert "m-bad" in router.ranked(["m-bad", "m-alt"], "retain")
+
+
+def test_one_fidelity_fail_does_not_exile_a_model(index):
+    """A violation can be stochastic; ONE strike must not drop a model that
+    the cascade then absorbed anyway. The second unrebutted one does."""
+    script = {"m1": [BAD_200]}
+    router, _ = make_router(index, script)
+    router.route(["m1"], {"messages": []}, "retain")
+    assert router.ranked(["m1"], "retain") == ["m1"]
+
+
+def test_probe_verdict_reports_rejected_for_fidelity_fail(index):
+    """Discovery consumes verdicts: a gated fidelity fail is a capability
+    signal (same family as http reject), never `busy` — busy models get
+    retried next pass; rejected pairs settle until their evidence goes stale.
+    The sample is recorded by _call either way, so unrebutted_fidelity_fails
+    gates the pair without any extra discovery logic."""
+    script = {"m1": [BAD_200]}
+    r, _ = make_router(index, script)
+    verdict, detail = r.probe_verdict("m1", "retain", PROBE)
+    assert verdict == "rejected", (verdict, detail)
+    assert "fidelity" in detail
+
+
+# --- re-probe arm reporting -----------------------------------------------------
+
+
+def test_reprobed_false_when_budget_exhausts_before_any_probe(index):
+    """`reprobed` used to be set True speculatively BEFORE the re-probe arm
+    ran, so a budget exhausted by the main loop reported a live re-probe that
+    never happened. The flag must mean a probe RAN."""
+    r = Router(index, "http://up/v1", "k",
+               RouterConfig(total_budget_s=0.05, request_timeout_s=0.04,
+                            probe_timeout_s=45.0),
+               transport=lambda u, b, h, t: (time.sleep(t), (500, {}))[1])
+    res = r.route(["m1", "m2"], {"messages": []}, "retain",
+                  probe_messages=PROBE)
+    assert not res.ok and res.reprobed is False
+
+
+def test_reprobed_true_only_after_a_probe_ran(index):
+    """Total miss + a probe that actually ran + success on the retry: the one
+    shape where the flag is True."""
+    script = {"m1": [(500, {})], "m2": [(500, {})]}
+    router, _ = make_router(index, script)
+    res = router.route(["m1", "m2"], {"messages": []}, "retain",
+                       probe_messages=PROBE)
+    assert res.ok and res.reprobed is True
