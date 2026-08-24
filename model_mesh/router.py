@@ -595,16 +595,24 @@ class Router:
         # never speculatively: a budget exhausted before the first probe must
         # not report work it did not do (audit 2026-08-24).
         #
-        # Gated on a non-empty ranking: this arm refreshes state FOR RANKED
-        # MODELS. When the floors excluded everything (whole-pool episode)
-        # there is nothing to refresh and each busy probe burns its full
+        # TIME-BOXED, not gated: this arm must stay reachable when ranking is
+        # EMPTY because auth-cooled models are legitimately re-probeable (a
+        # restored credential is invisible until something calls). But when
+        # the whole pool is merely busy, each hung probe burns its full
         # timeout — live-measured 2026-08-24 as six ~45s probes eating the
-        # whole 280s budget BEFORE the sweep could dial once. The sweep below
-        # is strictly stronger there: it dials the real body directly.
-        if probe_messages and order:
+        # entire budget before the sweep could dial once. So the arm gets at
+        # most a quarter of the remaining budget; the sweep below always has
+        # real money left for direct dials.
+        if probe_messages:
+            reprobe_box = time.monotonic() + max(15.0, _remaining() * 0.25)
+
+            def _box_left() -> float:
+                return reprobe_box - time.monotonic()
+
             fresh: list[str] = []
             for model_id in candidates:
-                if len(fresh) >= self.cfg.reprobe_top_n or _remaining() <= 1.0:
+                if (len(fresh) >= self.cfg.reprobe_top_n
+                        or _remaining() <= 1.0 or _box_left() <= 1.0):
                     break
                 b = self.index.breaker_get(model_id)
                 # Only 'gone' is truly terminal. 'down' AND 'auth' models are
@@ -613,7 +621,8 @@ class Router:
                 if b["state"] == "gone":
                     continue
                 if self.probe(model_id, op_class, probe_messages,
-                              timeout=min(self.cfg.probe_timeout_s, _remaining())):
+                              timeout=min(self.cfg.probe_timeout_s,
+                                          _remaining(), _box_left())):
                     fresh.append(model_id)
             reprobed_any = bool(fresh)
             for model_id in fresh:
