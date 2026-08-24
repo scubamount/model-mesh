@@ -594,7 +594,14 @@ class Router:
         # `reprobed` means a probe RAN — set only after the loop proves it,
         # never speculatively: a budget exhausted before the first probe must
         # not report work it did not do (audit 2026-08-24).
-        if probe_messages:
+        #
+        # Gated on a non-empty ranking: this arm refreshes state FOR RANKED
+        # MODELS. When the floors excluded everything (whole-pool episode)
+        # there is nothing to refresh and each busy probe burns its full
+        # timeout — live-measured 2026-08-24 as six ~45s probes eating the
+        # whole 280s budget BEFORE the sweep could dial once. The sweep below
+        # is strictly stronger there: it dials the real body directly.
+        if probe_messages and order:
             fresh: list[str] = []
             for model_id in candidates:
                 if len(fresh) >= self.cfg.reprobe_top_n or _remaining() <= 1.0:
