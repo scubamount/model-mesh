@@ -67,6 +67,16 @@ assert 0.0 < REFRESH_MARGIN < 1.0, (
 
 
 def fetch_catalog(base: str, api_key: str, timeout: float = 30.0) -> set[str]:
+    """Model IDs listed by the provider. NOT proof of serviceability.
+
+    NIM keeps retired models in this listing while their chat endpoint
+    hard-404s instantly (verified 2026-08-24: 6 of 6 sampled
+    catalog-listed-but-eol-marked ids returned immediate 404s mid-episode;
+    102 listed vs 67 actually serving). The catalog is only the candidate
+    universe — request-time evidence and `eol_at` marks are the truth.
+    Diffing this set against the index shows a gap during/after churn by
+    design; that gap is not a missed-adoption defect.
+    """
     url = base.rstrip("/") + "/models"
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {api_key}"}, method="GET"
