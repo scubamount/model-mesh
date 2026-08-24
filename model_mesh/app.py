@@ -93,16 +93,15 @@ async def chat_completions(request: Request):
         )
 
     op_class = alias.get("op_class", "retain")
-    # Rank the FULL pool and hand the WHOLE ranking to the router. No cap
-    # here: a pre-router `max_candidates` slice is what made "no healthy
-    # candidates" reachable (2026-08-24 — floors excluded everything, ranked()
-    # was [], the router got zero candidates, 503 in 11ms with ZERO dials).
-    # Dial depth belongs to RouterConfig.max_attempts + the sweep arm; the
-    # candidate list must stay complete so the sweep always has something to
-    # try. candidates_for() returns rows in DB insertion order, so capping
-    # first would keep an arbitrary subset and could drop the best model.
-    pool = ROUTER.ranked(candidates_for(INDEX, CFG["provider"]["name"], alias),
-                         op_class)
+    # Hand the router the RAW candidate pool. Ranking happens ONCE, inside
+    # route(): a pre-ranked handoff is what made "no healthy candidates"
+    # reachable twice over on 2026-08-24 — first via the max_candidates
+    # slice, then because ranked()=[] (floors excluded everything) meant the
+    # router received an EMPTY candidate list and could 503 in 11ms with
+    # zero dials. The router needs the unfiltered list so its last-resort
+    # sweep can walk models the floors rejected; it ranks for dial order
+    # itself.
+    pool = candidates_for(INDEX, CFG["provider"]["name"], alias)
     result = await asyncio.to_thread(
         ROUTER.route, pool, body, op_class, probe_messages(op_class)
     )
