@@ -75,6 +75,33 @@ DEFAULTS: dict = {
         # cascade onward rather than being lost; 120s let only 2 failures fit.
         "request_timeout_s": 90.0,
         "probe_timeout_s": 45.0,
+        # PER-OP_CLASS timeout overrides. Both numbers above were tuned on
+        # RETAIN latency and then applied to every op_class, which silently
+        # destroyed auto/consolidation.
+        #
+        # Measured 2026-08-24 on this box. Consolidation's own success p99 is
+        # 71.6s (max 94.3s), so a 45s PROBE and a 90s REQUEST cut into the real
+        # distribution: 1,183 of 2,203 consolidation timeouts in 24h landed in
+        # the 43-47s and 88-92s bands — i.e. AT the ceilings, not past them.
+        # Each one was recorded as a failure sample, and because ranking floors
+        # on measured success_rate, the whole pool then fell below
+        # min_success_rate: 25 of 26 candidates blocked by succ-floor, the 26th
+        # by the fidelity floor, so ranked() returned [] and /health reported
+        # "auto/consolidation: no healthy candidates". The mesh had timed out
+        # every candidate it had, then correctly concluded none of them worked.
+        #
+        # Proof it was the ceiling and not the models: probed live at 100s,
+        # gpt-oss-120b answered in 90.8s, gpt-oss-20b in 1.0s and
+        # nemotron-3-super-120b in 0.9s, and ALL THREE passed check_fidelity —
+        # while the index held them at success_rate 0.000, 0.091 and (fidelity-
+        # floored) respectively. gpt-oss-120b has 632 lifetime consolidation
+        # successes; it fails at 90s by less than a second.
+        #
+        # Keyed by op_class so a slow op_class cannot be fixed by inflating the
+        # budget for a fast one. Anything absent falls back to the values above.
+        # 2 * request stays under total_budget_s (2*135 = 270 < 280).
+        "request_timeout_s_by_op_class": {"consolidation": 135.0},
+        "probe_timeout_s_by_op_class": {"consolidation": 100.0},
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
         "min_failures_for_thin_floor": 2,

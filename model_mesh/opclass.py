@@ -27,15 +27,25 @@ CONSOLIDATION_MESSAGES = [
     {
         "role": "system",
         "content": (
-            "Consolidate the observation. Respond with ONLY a JSON object of the form "
-            '{"observation_id": "<echo the id>", "facts": ["fact1"]}. '
+            # This MUST stay the shape hindsight really asks for. It used to
+            # request {"observation_id","facts"}, which no consolidation caller
+            # ever sends, so probes measured compliance with a contract that
+            # existed nowhere else and passed while every real request failed
+            # (see check_fidelity). Probe and request are one contract.
+            "You are a memory consolidation system. Synthesize the new facts "
+            "into observations, merging with existing observations when "
+            "appropriate. Respond with ONLY a JSON object of the form "
+            '{"creates": [], "updates": [], "deletes": []}. '
+            "An empty envelope is valid when there is nothing to merge. "
             "No prose, no markdown."
         ),
     },
     {
         "role": "user",
         "content": json.dumps(
-            {"observation_id": "obs-4271", "text": "Scubamount logged a 30m dive."}
+            {"facts": [{"text": "Scubamount logged a 30m dive.",
+                        "context": "conversation between agent and user"}],
+             "observations": []}
         ),
     },
 ]
@@ -107,6 +117,25 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
     """A model may serve an op_class only if it obeys the structured-output
     contract: non-empty content, valid JSON, expected shape. Reasoning models
     that leave `content` empty (output in reasoning_content) fail on purpose.
+
+    The consolidation contract is the CREATES/UPDATES/DELETES envelope that
+    hindsight actually sends, not the {"observation_id","facts"} shape this
+    function used to demand. That mismatch was the 2026-08-24 wipeout: real
+    consolidation traffic returned a perfectly valid
+    `{"creates": [], "updates": [], "deletes": []}` and was scored
+    "missing/empty `facts` list" every time — 1,544 fidelity-fails, enough to
+    push all 26 candidates under min_success_rate so `ranked()` returned []
+    and /health read "no healthy candidates".
+
+    It stayed invisible because the PROBE asked for the wrong shape too: the
+    synthetic prompt requested {"observation_id","facts"}, models complied,
+    and probes passed 786/899 while real traffic failed 795/830. A checker
+    validated against its own probe rather than the caller's contract agrees
+    with itself forever. The probe prompt in CONSOLIDATION_MESSAGES is now the
+    real envelope, so probe and request are measured against one contract.
+
+    An EMPTY envelope is a valid, successful consolidation: "nothing to merge"
+    is a real answer. Only a missing/malformed envelope is a fidelity failure.
     """
     content = parse_content(response)
     if not content or not content.strip():
@@ -116,6 +145,19 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
     except (json.JSONDecodeError, ValueError):
         return False, "content is not valid JSON (markdown/prose leak)"
 
+    if op_class == "consolidation":
+        if not isinstance(parsed, dict):
+            return False, "consolidation: JSON is not an object"
+        keys = ("creates", "updates", "deletes")
+        present = [k for k in keys if k in parsed]
+        if not present:
+            return False, ("consolidation: missing creates/updates/deletes "
+                           "envelope")
+        bad = [k for k in present if not isinstance(parsed[k], list)]
+        if bad:
+            return False, f"consolidation: {', '.join(bad)} is not a list"
+        return True, "ok"
+
     if isinstance(parsed, list):
         facts = parsed
     elif isinstance(parsed, dict):
@@ -124,7 +166,4 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
         return False, "JSON is neither object nor array"
     if not isinstance(facts, list) or not facts:
         return False, "missing/empty `facts` list"
-    if op_class == "consolidation":
-        if not isinstance(parsed, dict) or not parsed.get("observation_id"):
-            return False, "consolidation: missing echoed `observation_id`"
     return True, "ok"

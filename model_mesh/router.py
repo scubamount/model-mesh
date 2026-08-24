@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .index import FIDELITY_FAIL_STATUS, Index, OK
-from .opclass import check_fidelity
+from .opclass import check_fidelity, parse_content
 from .quality import rank_key
 
 logger = logging.getLogger("model_mesh.router")
@@ -68,6 +68,17 @@ class RouterConfig:
     # a differing dataclass default here is dead code that misleads readers.
     # test_config_defaults_match_dataclass asserts the two stay in sync.
     probe_timeout_s: float = 45.0
+    # Per-op_class overrides for the two timeouts above; see config.py for the
+    # measured rationale. Absent op_class falls back to the scalar default.
+    # These defaults must MATCH config.py DEFAULTS["router"] like every other
+    # field here (test_config_defaults_match_dataclass asserts it): app.py
+    # builds the live router as RouterConfig(**CFG["router"]), so config.py
+    # wins at runtime and a differing default here would be misleading dead
+    # code.
+    request_timeout_s_by_op_class: dict = field(
+        default_factory=lambda: {"consolidation": 135.0})
+    probe_timeout_s_by_op_class: dict = field(
+        default_factory=lambda: {"consolidation": 100.0})
     # Auth failures must EXPIRE. They used to be terminal, and breaker state is
     # persisted in SQLite, so a single daemon start with a missing key (launchctl
     # setenv does not survive a restart of the machine) marked every model 'auth'
@@ -223,6 +234,21 @@ class Router:
 
     # -- breaker ------------------------------------------------------------
 
+    def _request_timeout(self, op_class: Optional[str]) -> float:
+        """The request budget for one op_class.
+
+        Single predicate for BOTH timeouts (see _probe_timeout below): every
+        call site routes through these two, so an op_class cannot end up with
+        a per-class probe budget and a retain-tuned request budget.
+        """
+        return self.cfg.request_timeout_s_by_op_class.get(
+            op_class, self.cfg.request_timeout_s)
+
+    def _probe_timeout(self, op_class: Optional[str]) -> float:
+        """The probe budget for one op_class. See _request_timeout."""
+        return self.cfg.probe_timeout_s_by_op_class.get(
+            op_class, self.cfg.probe_timeout_s)
+
     def _eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
         if b["state"] == "gone":
@@ -356,7 +382,8 @@ class Router:
         )
         t0 = time.monotonic()
         status_code, payload = self._transport(
-            url, upstream_body, headers, timeout or self.cfg.request_timeout_s
+            url, upstream_body, headers,
+            timeout or self._request_timeout(op_class)
         )
         ms = (time.monotonic() - t0) * 1000.0
 
@@ -377,10 +404,29 @@ class Router:
                 self.index.record(model_id, op_class, source,
                                   FIDELITY_FAIL_STATUS, ms, payload_chars,
                                   request_id=request_id)
+                # Log the REQUEST that failed alongside the verdict, truncated.
+                # Added 2026-08-24: 1,544 fidelity-fails all read
+                # "missing/empty `facts` list" and none could be reproduced —
+                # hand-built payloads passed at every size from 2KB to 54KB on
+                # the same models. The reason was unreachable because the log
+                # recorded the verdict and the payload SIZE but never the
+                # payload, so the one thing that distinguished a failing call
+                # from a passing one was the one thing not captured. A failure
+                # message that cannot reproduce its own failure is not
+                # diagnostic.
+                try:
+                    _msgs = body.get("messages") or []
+                    _last = _msgs[-1].get("content", "") if _msgs else ""
+                    _sys = _msgs[0].get("content", "") if _msgs else ""
+                    _got = parse_content(payload)
+                except Exception:      # never let logging break routing
+                    _last = _sys = _got = "<unavailable>"
                 logger.warning(
                     "fidelity-fail model=%s op_class=%s source=%s "
-                    "payload_chars=%d why=%s",
+                    "payload_chars=%d why=%s system=%.200r user_tail=%.300r "
+                    "response=%.300r",
                     model_id, op_class, source, payload_chars, why,
+                    _sys, _last[-300:], _got,
                 )
                 return payload, Attempt(model_id, FIDELITY_FAIL_STATUS, ms, why)
             self.index.record(model_id, op_class, source, OK, ms, payload_chars,
@@ -506,7 +552,7 @@ class Router:
         }
         payload, att = self._call(
             model_id, body, op_class, source="probe",
-            timeout=timeout or self.cfg.probe_timeout_s,
+            timeout=timeout or self._probe_timeout(op_class),
         )
         if payload is None or att.status != OK:
             status = str(att.status or "")
@@ -565,7 +611,7 @@ class Router:
             share it, so neither arm can drift into accepting prose."""
             payload, att = self._call(
                 mid, body, op_class, source=source,
-                timeout=min(self.cfg.request_timeout_s, _remaining()),
+                timeout=min(self._request_timeout(op_class), _remaining()),
                 request_id=request_id,
             )
             result.attempts.append(att)   # telemetry: EVERY dial is recorded
@@ -621,7 +667,7 @@ class Router:
                 if b["state"] == "gone":
                     continue
                 if self.probe(model_id, op_class, probe_messages,
-                              timeout=min(self.cfg.probe_timeout_s,
+                              timeout=min(self._probe_timeout(op_class),
                                           _remaining(), _box_left())):
                     fresh.append(model_id)
             reprobed_any = bool(fresh)
@@ -676,7 +722,7 @@ class Router:
                     break
                 payload, att = self._call(
                     model_id, body, op_class, source="sweep",
-                    timeout=min(self.cfg.request_timeout_s, left),
+                    timeout=min(self._request_timeout(op_class), left),
                     request_id=request_id,
                 )
                 result.attempts.append(att)   # EVERY dial is recorded

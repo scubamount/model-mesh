@@ -207,6 +207,17 @@ async def mesh_status():
             "max_candidates": None,
             "scores": scores,
             "rank_inputs": rank_inputs,
+            # The timeouts THIS op_class actually runs under, read off the live
+            # router rather than restated from config. Added 2026-08-24: the
+            # per-op_class override that fixed auto/consolidation could not be
+            # confirmed in-process at all — /mesh/status exposed no config, so
+            # "is the new knob wired?" was unanswerable without restarting the
+            # daemon and inferring from behavior. A value that decides routing
+            # has to be inspectable here, same rule as rank_inputs above.
+            "timeouts": {
+                "request_timeout_s": ROUTER._request_timeout(oc),
+                "probe_timeout_s": ROUTER._probe_timeout(oc),
+            },
         }
     return out
 
