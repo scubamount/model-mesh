@@ -3,22 +3,50 @@
 **One local OpenAI-compatible endpoint that never dies.**
 
 A health-aware model router for NVIDIA NIM (and any OpenAI-compatible upstream).
-Replaces a static proxy + hourly auto-ranker with request-time routing built on
-a persistent model index.
+Point a client at one localhost URL and ask for `auto/retain`; the mesh picks the
+best model that is actually up right now, cascades through the rest when that
+one fails, and only refuses once every live model has verifiably failed inside
+your request.
+
+Built for **free shared inference endpoints**, where models go overloaded for
+minutes, disappear for days, and get retired without warning while still being
+listed in the catalog.
+
+## Quickstart
+
+```sh
+git clone <your-fork> model-mesh && cd model-mesh
+sh scripts/install-launchd.sh          # macOS: daemon + daily discovery job
+echo 'NVIDIA_API_KEY=<your-api-key>' >> ~/.model-mesh/.env
+chmod 600 ~/.model-mesh/.env
+curl -s http://127.0.0.1:8002/health
+```
+
+Then point any OpenAI-compatible client at `http://127.0.0.1:8002/v1` and use
+`auto/retain` (or any configured alias) as the model name. No config file is
+required — every default ships in `model_mesh/config.py`.
+
+Not on macOS, or prefer to run it yourself:
+
+```sh
+python3.12 -m venv .venv && .venv/bin/pip install -e .
+MESH_HOME=~/.model-mesh .venv/bin/model-mesh   # serves config's `listen`
+```
 
 ## Why (the failure that motivated this)
 
-The predecessor (`nim-proxy` + hourly ranker) failed in a specific, instructive way:
+The predecessor (a static proxy + hourly ranker) failed in a specific,
+instructive way:
 
 1. `meta/llama-4-maverick` hit EOL (`410 Gone`) on 2026-07-27. The static
    candidate list silently shrank to one model.
-2. The litellm fallback tier was hardcoded to the *same* model the alias
-   resolved to — primary and fallback were identical. Zero redundancy.
-3. The hourly ranker probed with a ~50-char toy prompt; real retain payloads
-   are ~14k chars. The probe ranked gpt-oss-20b "fastest" (~2s) while it took
-   27.9s on real work — starving hindsight's retain into 300s timeouts.
-4. Every health check that should have caught this could not fail:
-   `/health` only checked Postgres, the ranker only checked its own toy probe.
+2. The fallback tier was hardcoded to the *same* model the alias resolved to —
+   primary and fallback were identical. Zero redundancy.
+3. The hourly ranker probed with a ~50-char toy prompt; real payloads are ~14k
+   chars. The probe ranked gpt-oss-20b "fastest" (~2s) while it took 27.9s on
+   real work — starving the client into 300s timeouts.
+4. Every health check that should have caught this could not fail: `/health`
+   only checked its database, the ranker only checked its own toy probe.
 
 Memory writes silently failed for a week. **Every design decision below traces
 back to one of those four failures.**
@@ -26,7 +54,7 @@ back to one of those four failures.**
 ## Architecture
 
 ```
-client (hindsight / hermes / opencode)
+client (any OpenAI-compatible caller)
    │  POST /v1/chat/completions  model=auto/retain
    ▼
 ┌──────────────────────────────────────────────┐
@@ -56,9 +84,10 @@ client (hindsight / hermes / opencode)
 
 ### The model index (the durable part)
 
-SQLite `mesh.db` in the mesh's **state directory** — the location ships as
-`db_path` in `model_mesh/config.py` and every artifact below (db, daemon log,
-discovery log, audit JSONL) lives under that same one directory. Tables:
+SQLite `mesh.db` in the mesh's **state directory** (`$MESH_HOME`, default
+`~/.model-mesh`). Every artifact lives under that one root — db, `config.yaml`,
+the key-fallback `.env`, daemon log, discovery log, audit JSONL — so one env var
+relocates the whole install and nothing can move half of it. Tables:
 
 - `models` — every model ever seen in a catalog sync: id, provider,
   first_seen, last_seen, eol_at (when it vanished or started returning
@@ -71,10 +100,10 @@ discovery log, audit JSONL) lives under that same one directory. Tables:
 
 ### Ranking: quality orders, availability gates
 
-The mesh's job is uptime for hindsight on free NIM endpoints, where models go
-overloaded or vanish unpredictably — that churn is the only reason to probe
-anything. Two properties matter, on two different timescales, and blending them
-into a single number is what broke:
+The mesh's job is uptime on free shared endpoints, where models go overloaded or
+vanish unpredictably — that churn is the only reason to probe anything. Two
+properties matter, on two different timescales, and blending them into a single
+number is what broke:
 
 | | timescale | measurable? | role |
 |---|---|---|---|
@@ -160,9 +189,8 @@ attempt count):
    miss means trying beats refusing), deduped against every model this
    request already dialed, skipping terminal ghosts, capped at
    `sweep_max_models` (12). This is what makes "no healthy candidates"
-   require a whole-pool failure inside one request: hindsight retain must
-   fail only when every live NIM model verifiably failed within that
-   request.
+   require a whole-pool failure inside one request: a request may fail only
+   when every live model verifiably failed within it.
 5. All arms missed → `503` with `models_tried` + per-model failure reasons —
    an honest verdict backed by evidence, not a guess.
 
@@ -237,11 +265,26 @@ unpredictably:
 
 ### Config
 
-The optional `config.yaml` (same state directory) is currently absent on this
-machine: every default below ships in `model_mesh/config.py` and the daemon
-boots with no config file. Aliases carry op_class + include/exclude patterns
-only (the pool is discovered, not enumerated); secrets stay in env, never in
-the DB or config.
+Every default ships in `model_mesh/config.py`; the daemon boots with no config
+file at all. An optional `config.yaml` in the state directory overrides any
+subset (deep-merged, so you only write what you change). Aliases carry op_class +
+include/exclude patterns only — the pool is discovered, not enumerated. Secrets
+stay in env or the key-fallback file, never in the DB or config.
+
+```yaml
+# ~/.model-mesh/config.yaml — everything here is optional
+listen:
+  host: 127.0.0.1
+  port: 8002
+provider:
+  name: nim
+  base_url: https://integrate.api.nvidia.com/v1
+  api_key_env: NVIDIA_API_KEY
+```
+
+`listen` is the **only** place the serving address is defined — the launchd
+agent runs the `model-mesh` entrypoint and passes no host/port, so editing this
+file and restarting is how you move the port.
 
 Router knobs worth knowing:
 
@@ -251,27 +294,36 @@ Router knobs worth knowing:
 | `router.reprobe_top_n` | `4` | passes of live probing in arm 2 |
 | `router.sweep_on_total_miss` | `true` | enable arm 3 |
 | `router.sweep_max_models` | `12` | max direct dials in arm 3 |
-| `router.total_budget_s` | `280` | whole-cascade deadline (< hindsight's 300s) |
+| `router.total_budget_s` | `280` | whole-cascade deadline; keep under the client's own timeout |
 | `router.request_timeout_s` | `90` | price of one hung attempt |
+| `router.request_timeout_s_by_op_class` | `{consolidation: 135}` | per-op_class override; some ops are legitimately slower |
+| `router.probe_timeout_s` | `45` | probe attempt ceiling |
+| `router.probe_timeout_s_by_op_class` | `{consolidation: 100}` | per-op_class probe override |
 | `router.overload_p95_ms` | `20000` | p95 at/above this = overloaded → demoted |
+| `router.max_p95_ms_for_eligibility` | `75000` | measured p95 above this excludes the model |
 | `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the size heuristic misjudges |
 | `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
 | `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
+| `router.breaker_threshold` | `3` | consecutive fails before a model opens its breaker |
+| `router.breaker_cooldown_s` | `120` | first cooldown; doubles to `breaker_cooldown_max_s` (1800) |
+| `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` = whole pool |
+| `discovery.max_probes_per_pass` | `25` | hard ceiling per discovery pass |
+
+Keep `2 × request_timeout_s < total_budget_s` so one slow model cannot consume
+the whole cascade.
 
 ## Compatibility
 
-Drop-in for the nim-proxy contract hindsight speaks: `openai/auto/retain`,
-`auto/consolidation`, `auto/reflect`, `auto/evolve` aliases on an
-OpenAI-compatible localhost port.
+Any OpenAI-compatible client works unmodified — point its base URL at
+`http://127.0.0.1:8002/v1` and use an alias as the model name. The default
+aliases are `auto/retain`, `auto/consolidation`, `auto/reflect` and
+`auto/evolve`; raw model ids also pass through, with breaker protection and
+telemetry but no cascade.
 
-**Cutover is done.** Hindsight's profile points every LLM base URL at
-`http://127.0.0.1:8002/v1` — retain, reflect, consolidation and evolution
-traffic all flow through the mesh, with a litellm fallback tier to a pinned
-`openai/gpt-oss-20b` on the same port.
-
-`auto/evolve` serves DSPy-style skill evolution on its own `evolve` op_class —
-scores are per-op_class, so evolution traffic must not vote in the ranking that
-picks the memory models.
+Scores are **per-op_class**, which is why the aliases are separate: one workload's
+traffic must not vote in the ranking that serves another. `auto/reflect`
+deliberately maps to the `retain` op_class (same contract, same evidence pool);
+`auto/evolve` gets its own.
 
 ## Non-goals (v1)
 
@@ -311,13 +363,46 @@ picks the memory models.
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (196 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (216 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
   that time. It is not in git and nothing here regenerates it — back it up with
   sqlite `.backup` (WAL-safe) on a schedule. A running daemon is not a backup:
   uptime reads as safety, which is why this had none for months.
+
+## Troubleshooting
+
+**`/health` returns 503.** It is *deep* by design: it fails unless the upstream
+catalog is reachable AND every configured alias has ≥1 healthy candidate. Check
+`GET /mesh/status` — if `ranking_all` is empty for an alias, nothing has evidence
+yet; run `POST /mesh/probe`. A brand-new install has an empty index and is
+legitimately unhealthy until the first discovery pass lands.
+
+**Every request 401s.** The daemon does not inherit your shell environment.
+Put the key in `$MESH_HOME/.env` (`NVIDIA_API_KEY=...`, mode 0600) rather than
+relying on `launchctl setenv`, which does not survive a restart. The key is read
+at call time, so no restart is needed after writing the file.
+
+**Ranking looks alphabetical.** That is the tell that nothing is actually
+scored — check `rank_inputs` in `/mesh/status`. Models with `bucket: unknown`
+have no in-window evidence; they sort behind everything measured healthy.
+
+**A model you expect is missing from `ranking_all`.** Either an eligibility
+floor excluded it (check `scores` for `success_rate` and `n`) or its breaker is
+`gone` — a 404/410 at request time marks `eol_at` permanently. `/mesh/models`
+shows breaker state per model.
+
+**Requests are slow but succeed.** Expected on free shared endpoints: p95 above
+`overload_p95_ms` (20s) demotes a model below everything healthy, and it is
+promoted back for free when its p95 recovers. Nothing marks or unmarks it. If
+*everything* is overloaded, the mesh is doing its job — serving the least-bad
+model that answers.
+
+**Reinstalling.** `install-launchd.sh` adopts an existing install (label prefix
+and state dir) rather than creating a second one. To deliberately run a second
+independent instance, set both `MESH_HOME` and `MESH_LABEL_PREFIX`, and a
+different `MESH_PORT`.
 
 ## License
 
