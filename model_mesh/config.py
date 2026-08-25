@@ -120,7 +120,7 @@ DEFAULTS: dict = {
         # asserts the two files agree.
         "fidelity_fails_for_floor": 2,
         # Must satisfy 2 * this < total_budget_s so a slow model can't consume
-        # the cascade; audit-timeout-chain.py asserts the relationship.
+        # the cascade; test_deployment_contract.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,
         # Keep this UNDER the calling client's own timeout so the client never
         # abandons the request mid-cascade. 280 fits 3 full-price 90s attempts

@@ -19,7 +19,7 @@ import urllib.request
 from typing import Optional
 
 from .index import SCORE_WINDOW_S, Index
-from .opclass import check_fidelity, probe_messages
+from .opclass import probe_messages
 from .quality import tier as quality_tier
 from .router import Router
 
@@ -214,7 +214,7 @@ def discover(
             #
             # This is the practical shape of the problem: NIM's catalog is ~24
             # usable text models and grows, but the cascade only ever tries
-            # max_attempts (3) of them. Probing all 24 to pick 3 spends the
+            # max_attempts (8) of them. Probing every model to pick 8 spends the
             # budget proving that models we will not use are fine.
             if probe_top_n is not None:
                 pool = sorted(
@@ -295,7 +295,7 @@ def discover(
                 # `rejected` = 400/413/422: the provider parsed the request and
                 # refused it, so this op_class is settled until the evidence
                 # goes stale. _call already recorded the sample, so scoring and
-                # Router._eligible (via unrebutted_reject) both see it and no
+                # Router.eligible (via unrebutted_reject) both see it and no
                 # further pass re-probes this pair. Keep probing the model's
                 # OTHER op_classes: a reject is per-request-shape, not a
                 # property of the model.
@@ -320,7 +320,7 @@ def candidates_for(
     subset and could discard the best-scoring model outright. With a wide
     catalog that turns the cap into a correctness bug rather than a cost
     control, so ordering happens first and the caller caps the RANKED list.
-    Cost is bounded by max_attempts (3), not by pool size — the router only
+    Cost is bounded by max_attempts, not by pool size — the router only
     ever dials the top few.
     """
     return [

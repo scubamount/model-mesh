@@ -152,8 +152,10 @@ def test_breaker_reopen_doubles_cooldown(index):
 def test_ranking_prefers_stable_model(index):
     # m_fast: consistently 100ms. m_spiky: median low but wild spikes.
     for _ in range(20):
+        index.ensure_model("m_fast")
         index.record("m_fast", "retain", "request", OK, 100.0)
     for i in range(20):
+        index.ensure_model("m_spiky")
         index.record("m_spiky", "retain", "request", OK,
                       80.0 if i % 2 else 9000.0)
     router, t = make_router(index)
@@ -163,6 +165,7 @@ def test_ranking_prefers_stable_model(index):
 
 def test_unknown_models_rank_after_scored_but_stay(index):
     for _ in range(5):
+        index.ensure_model("known")
         index.record("known", "retain", "request", OK, 100.0)
     router, t = make_router(index)
     order = router.ranked(["newcomer", "known"], "retain")
@@ -197,6 +200,7 @@ def test_total_miss_without_probe_messages_fails_with_evidence(index):
 # --- telemetry -------------------------------------------------------------------
 
 def test_real_traffic_lands_in_index(index):
+    index.ensure_model("m1")
     router, t = make_router(index)
     router.route(["m1"], {"messages": [{"role": "user", "content": "hi"}]},
                  "retain")
@@ -211,6 +215,7 @@ def test_intermittent_model_skipped_by_success_floor(index):
     gpt-oss-20b timed out 6 of 8 retain calls at 120s each without ever hitting
     3 in a row, stayed top-ranked, and every retain paid the timeout first."""
     for i in range(8):
+        index.ensure_model("flaky")
         index.record("flaky", "retain", "request",
                      OK if i % 4 == 0 else "timeout",
                      100.0 if i % 4 == 0 else None)
@@ -223,9 +228,11 @@ def test_success_floor_is_per_op_class(index):
     """nemotron-49b: 43% on retain (http-400) but 100% on consolidation. It must
     stay eligible for the op_class it actually serves."""
     for i in range(8):
+        index.ensure_model("m")
         index.record("m", "retain", "request",
                      OK if i < 3 else "http-400", 200.0)
     for _ in range(5):
+        index.ensure_model("m")
         index.record("m", "consolidation", "request", OK, 500.0)
     router, t = make_router(index)
     assert router.ranked(["m"], "retain") == []
@@ -234,6 +241,7 @@ def test_success_floor_is_per_op_class(index):
 
 def test_floor_needs_min_samples(index):
     """One bad sample must not exile a model — that's what the breaker is for."""
+    index.ensure_model("new")
     index.record("new", "retain", "request", "timeout", None)
     router, t = make_router(index)
     assert router.ranked(["new"], "retain") == ["new"]
@@ -248,8 +256,10 @@ def test_latency_floor_excludes_a_model_that_eats_the_cascade_budget(index):
     'processing' until the watchdog reset it. Ranking already knew it was bad
     (score 51.9 vs 66.4); eligibility did not look at latency at all."""
     for i in range(10):                     # 70% success, all of them slow
+        index.ensure_model("slow")
         index.record("slow", "retain", "request",
                      OK if i % 10 < 7 else "timeout", 96_900.0)
+    index.ensure_model("fast")
     index.record("fast", "retain", "request", OK, 5_000.0)
     router, t = make_router(index)
     s = index.score("slow", "retain")
@@ -260,6 +270,7 @@ def test_latency_floor_excludes_a_model_that_eats_the_cascade_budget(index):
 def test_latency_floor_respects_min_samples(index):
     """A single slow sample must not exile a model, same rule as the success
     floor — cold starts and one-off spikes are not a verdict."""
+    index.ensure_model("cold")
     index.record("cold", "retain", "request", OK, 300_000.0)
     router, t = make_router(index)
     assert router.ranked(["cold"], "retain") == ["cold"]
@@ -269,7 +280,9 @@ def test_latency_floor_is_per_op_class(index):
     """Consolidation legitimately runs longer than retain. A model that is slow
     on one op_class must stay eligible for the other, like the success floor."""
     for _ in range(6):
+        index.ensure_model("m")
         index.record("m", "retain", "request", OK, 96_900.0)     # too slow
+        index.ensure_model("m")
         index.record("m", "consolidation", "request", OK, 40_000.0)  # fine
     router, t = make_router(index)
     assert router.ranked(["m"], "retain") == []
@@ -484,6 +497,7 @@ BAD_200 = (200, {"choices": [{"message": {"content": "Sure! Here are the facts:"
 def test_fidelity_fail_is_recorded_not_ok(index):
     """A 200 that violates the JSON contract must never write an `ok` sample:
     that taught the ranking the worst-behaved model was the best one."""
+    index.ensure_model("m1")
     router, _ = make_router(index, {"m1": [BAD_200]})
     res = router.route(["m1"], {"messages": []}, "retain")
     s = index.score("m1", "retain")
@@ -517,6 +531,8 @@ def test_two_unrebutted_fidelity_fails_drop_model_from_ranking(index):
     """Two consecutive contract violations with no success between them is the
     settled signal an http reject is: the model leaves the cascade until the
     recheck window elapses or a success intervenes."""
+    index.ensure_model("m-bad")
+    index.ensure_model("m-alt")
     script = {"m-bad": [BAD_200] * 3}
     router, t = make_router(index, script)
     router.route(["m-bad"], {"messages": []}, "retain")   # strike 1
@@ -525,8 +541,10 @@ def test_two_unrebutted_fidelity_fails_drop_model_from_ranking(index):
     # Recovery has two layers and both are real: ONE success clears the
     # fidelity GATE (unrebutted run broken), and the ordinary success-rate
     # floors re-admit the model once its measured rate earns it back.
+    index.ensure_model("m-bad")
     index.record("m-bad", "retain", "probe", OK, 900.0)
     for _ in range(2):
+        index.ensure_model("m-bad")
         index.record("m-bad", "retain", "probe", OK, 900.0)
     assert "m-bad" in router.ranked(["m-bad", "m-alt"], "retain")
 
@@ -590,6 +608,7 @@ def test_sweep_reaches_ineligible_when_floors_exclude_everything(index):
     # 4 all-fail samples each => below min_success_rate floor at
     # min_samples_for_floor => ineligible for retain => ranked() == [].
     for m in ("m1", "m2", "m3"):
+        index.ensure_model(m)
         for _ in range(4):
             index.record(m, "retain", "probe", "http-500", 1000.0)
     ok_body = {"choices": [{"message": {"content": '{"facts": ["x"]}'}}],
@@ -698,6 +717,9 @@ def test_sweep_skips_gone_models(index):
     concurrent request AFTER our ranking was computed still sits in `order`
     and must not be swept. a-marker (rank 0) fails and marks z-late gone
     mid-request; both later arms must pass over the freshly-dead ghost."""
+    index.ensure_model("a-marker")
+    index.ensure_model("z-late")
+
     def transport(url, body, headers, timeout):
         if body["model"] == "a-marker":
             # Concurrent discovery retires z-late after our ranking.

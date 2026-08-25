@@ -126,9 +126,11 @@ def test_ranked_then_capped_keeps_the_best_model(index):
     # latency. Passing them swapped records every sample as failed, which the
     # success floor then rejects, and the model vanishes from ranked().
     for _ in range(5):
+        index.ensure_model(best)
         index.record(best, "retain", "request", OK, 900.0, 100)
     for m in TEXT_MODELS[:3]:
         for _ in range(5):
+            index.ensure_model(m)
             index.record(m, "retain", "request", OK, 25_000.0, 100)
 
     router = Router(index, "https://x/v1", "k", RouterConfig())
@@ -168,6 +170,7 @@ def test_discovery_does_not_reprobe_models_that_have_evidence(index, monkeypatch
 
     _seed(index, TEXT_MODELS)
     for m in TEXT_MODELS:
+        index.ensure_model(m)
         index.record(m, "retain", "request", OK, 1000.0, 100)
 
     probed = []
@@ -233,7 +236,7 @@ def _router_returning(index, status, payload=None, detail=""):
     from model_mesh.router import Router, RouterConfig
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
-    r._call = lambda *a, **k: (payload, _FakeAttempt(status, detail))
+    r.dial = lambda *a, **k: (payload, _FakeAttempt(status, detail))
     return r
 
 
@@ -333,10 +336,12 @@ def test_unusable_404_is_marked_gone_once(index, monkeypatch):
     assert index.live_models("nim") == [], "non-servable models stayed live"
 
 
-def test_boolean_probe_still_works_for_callers(index):
-    """probe() keeps its bool contract; only `pass` is True."""
-    assert _router_returning(index, "http-598").probe("m", "retain", []) is False
-    assert _router_returning(index, "http-404").probe("m", "retain", []) is False
+def test_probe_verdict_distinguishes_busy_from_unusable(index):
+    """A bare bool collapsed "overloaded right now" into "cannot do the job" —
+    the 2026-08-08 bug that permanently excluded popular models. The verdict
+    must keep them distinct: 5xx -> busy (retryable), 404 -> unusable."""
+    assert _router_returning(index, "http-598").probe_verdict("m", "retain", [])[0] == "busy"
+    assert _router_returning(index, "http-404").probe_verdict("m", "retain", [])[0] == "unusable"
 
 
 # -- confidence weighting ------------------------------------------------------
@@ -375,7 +380,13 @@ def test_single_sample_does_not_outrank_a_proven_model(index):
 
     # proven: healthy and fast. newcomer: one sample, but overloaded.
     for _ in range(20):
+        index.ensure_model("nvidia/proven-31b")
+        index.ensure_model("nvidia/proven-31b")
+        index.ensure_model("nvidia/proven-31b")
         index.record("nvidia/proven-31b", "retain", "request", OK, 2_000.0, 12_000)
+    index.ensure_model("nvidia/newcomer-31b")
+    index.ensure_model("nvidia/newcomer-31b")
+    index.ensure_model("nvidia/newcomer-31b")
     index.record("nvidia/newcomer-31b", "retain", "probe", OK, 44_000.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -392,6 +403,9 @@ def test_newcomer_still_beats_an_unknown(index):
     from model_mesh.router import Router, RouterConfig
 
     index.sync_catalog("nim", {"newcomer", "unknown"})
+    index.ensure_model("newcomer")
+    index.ensure_model("newcomer")
+    index.ensure_model("newcomer")
     index.record("newcomer", "retain", "probe", OK, 400.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -412,8 +426,14 @@ def test_evidence_is_not_entitlement(index):
     from model_mesh.router import Router, RouterConfig
 
     for _ in range(36):
+        index.ensure_model("nvidia/incumbent-31b")
+        index.ensure_model("nvidia/incumbent-31b")
+        index.ensure_model("nvidia/incumbent-31b")
         index.record("nvidia/incumbent-31b", "retain", "request", OK, 44_000.0, 12_000)
     for _ in range(3):
+        index.ensure_model("nvidia/challenger-31b")
+        index.ensure_model("nvidia/challenger-31b")
+        index.ensure_model("nvidia/challenger-31b")
         index.record("nvidia/challenger-31b", "retain", "request", OK, 2_500.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -429,8 +449,14 @@ def test_a_failing_model_ranks_below_everything_measured_working(index):
     from model_mesh.router import Router, RouterConfig
 
     for _ in range(20):
+        index.ensure_model("nvidia/good-31b")
+        index.ensure_model("nvidia/good-31b")
+        index.ensure_model("nvidia/good-31b")
         index.record("nvidia/good-31b", "retain", "request", OK, 2_000.0, 12_000)
     for _ in range(20):
+        index.ensure_model("nvidia/bad-31b")
+        index.ensure_model("nvidia/bad-31b")
+        index.ensure_model("nvidia/bad-31b")
         index.record("nvidia/bad-31b", "retain", "request", "http-500", None, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -450,7 +476,16 @@ def test_quality_outranks_speed_at_equal_availability(index):
     from model_mesh.index import OK
     from model_mesh.router import Router, RouterConfig
 
+    index.ensure_model("meta/llama-3.1-8b-instruct")
+
+    index.ensure_model("meta/llama-3.1-8b-instruct")
+
+    index.ensure_model("meta/llama-3.1-8b-instruct")
+
     index.record("meta/llama-3.1-8b-instruct", "retain", "probe", OK, 400.0, 12_000)
+    index.ensure_model("openai/gpt-oss-120b")
+    index.ensure_model("openai/gpt-oss-120b")
+    index.ensure_model("openai/gpt-oss-120b")
     index.record("openai/gpt-oss-120b", "retain", "probe", OK, 3_000.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -472,6 +507,7 @@ def test_ranking_has_resolution_across_a_latency_spread(index):
     # so that alphabetical order is the REVERSE of the correct order.
     ids = ["nvidia/a-slow-31b", "nvidia/b-mid-31b", "nvidia/c-fast-31b"]
     for mid, lat in zip(ids, (18_000.0, 6_000.0, 900.0)):
+        index.ensure_model(mid)
         index.record(mid, "retain", "probe", OK, lat, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -598,6 +634,7 @@ def test_deterministically_rejecting_model_is_ineligible(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "nvidia/nemotron-mini-4b-instruct"
+    index.ensure_model(mid)
     index.record(mid, "retain", "probe", "http-400", 267.0, 11653)
     r = Router(index, "https://x/v1", "k", RouterConfig())
 
@@ -605,7 +642,7 @@ def test_deterministically_rejecting_model_is_ineligible(index):
     assert s.n < RouterConfig().min_samples_for_floor, (
         "precondition: this bug exists BECAUSE n stays under the floor "
         f"(n={s.n}); if the floor could see it, no new gate would be needed")
-    assert not r._eligible(mid, "retain"), (
+    assert not r.eligible(mid, "retain"), (
         "a model that deterministically rejects retain must not stay eligible")
 
 
@@ -621,8 +658,11 @@ def test_thin_evidence_repeated_failure_is_ineligible(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "openai/gpt-oss-120b"
+    index.ensure_model(mid)
     index.record(mid, "retain", "chat", "ok", 1740.0, 900)
+    index.ensure_model(mid)
     index.record(mid, "retain", "chat", "http-500", 1740.0, 900)
+    index.ensure_model(mid)
     index.record(mid, "retain", "chat", "http-500", 1740.0, 900)
     r = Router(index, "https://x/v1", "k", RouterConfig())
 
@@ -631,7 +671,7 @@ def test_thin_evidence_repeated_failure_is_ineligible(index):
         "precondition: the bug exists BECAUSE n stays under the sample floor "
         f"(n={s.n})")
     assert s.success_rate < 0.5, f"precondition: majority-failing (got {s.success_rate})"
-    assert not r._eligible(mid, "retain"), (
+    assert not r.eligible(mid, "retain"), (
         "a model that has failed twice of three must not take live memory "
         "traffic just because it has not yet earned a 4th sample")
 
@@ -642,10 +682,11 @@ def test_thin_evidence_floor_spares_a_single_failure(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "nvidia/nemotron-3-super-120b-a12b"
+    index.ensure_model(mid)
     index.record(mid, "retain", "chat", "http-500", 1200.0, 900)
     r = Router(index, "https://x/v1", "k", RouterConfig())
 
-    assert r._eligible(mid, "retain"), (
+    assert r.eligible(mid, "retain"), (
         "a single failure is not evidence of a failing model")
 
 
@@ -656,12 +697,14 @@ def test_reject_is_scoped_to_the_op_class(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "nvidia/llama-3.3-nemotron-super-49b-v1"
+    index.ensure_model(mid)
     index.record(mid, "retain", "request", "http-400", 300.0, 12618)
+    index.ensure_model(mid)
     index.record(mid, "consolidation", "request", "ok", 35_000.0, 12000)
     r = Router(index, "https://x/v1", "k", RouterConfig())
 
-    assert not r._eligible(mid, "retain")
-    assert r._eligible(mid, "consolidation"), (
+    assert not r.eligible(mid, "retain")
+    assert r.eligible(mid, "consolidation"), (
         "a reject on one op_class must not exclude the model from another")
 
 
@@ -671,12 +714,14 @@ def test_a_later_success_rebuts_the_reject(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "some/model"
+    index.ensure_model(mid)
     index.record(mid, "retain", "probe", "http-400", 250.0, 12000)
     r = Router(index, "https://x/v1", "k", RouterConfig())
-    assert not r._eligible(mid, "retain")
+    assert not r.eligible(mid, "retain")
 
+    index.ensure_model(mid)
     index.record(mid, "retain", "request", "ok", 9_000.0, 12000)
-    assert r._eligible(mid, "retain"), "a later success must rebut the reject"
+    assert r.eligible(mid, "retain"), "a later success must rebut the reject"
 
 
 def test_reject_goes_stale_and_admits_a_retry(index):
@@ -686,6 +731,7 @@ def test_reject_goes_stale_and_admits_a_retry(index):
     from model_mesh.index import REJECT_RECHECK_S
 
     mid = "some/model"
+    index.ensure_model(mid)
     index.record(mid, "retain", "probe", "http-400", 250.0, 12000)
     with index._lock:
         index._conn.execute(
@@ -704,10 +750,11 @@ def test_transient_failure_is_not_treated_as_a_reject(index):
     from model_mesh.router import Router, RouterConfig
 
     mid = "openai/gpt-oss-120b"
+    index.ensure_model(mid)
     index.record(mid, "retain", "request", "http-503", 900.0, 12000)
     r = Router(index, "https://x/v1", "k", RouterConfig())
     assert index.unrebutted_reject(mid, "retain") is None
-    assert r._eligible(mid, "retain"), "503 is overload, not a capability verdict"
+    assert r.eligible(mid, "retain"), "503 is overload, not a capability verdict"
 
 
 # -- proven models keep their cascade slot -------------------------------------
@@ -743,6 +790,7 @@ def _seed_live_consolidation_regime(index, mid):
         41.2, 42.4, 43.1, 47.2, 50.3, 53.1, 54.2, 55.4, 56.1, 66.3, 74.7,
         83.2, 88.4,
     ]:
+        index.ensure_model(mid)
         index.record(mid, "consolidation", "request", "ok", seconds * 1000.0, 12_000)
 
 
@@ -770,6 +818,7 @@ def test_proven_model_is_not_evicted_by_unproven_ones(index):
 
     proven = "nvidia/llama-3.3-nemotron-super-49b-v1"   # tier 4
     for _ in range(36):
+        index.ensure_model(proven)
         index.record(proven, "consolidation", "request", "ok", 3_000.0, 12_000)
 
     s = index.score(proven, "consolidation")
@@ -781,6 +830,7 @@ def test_proven_model_is_not_evicted_by_unproven_ones(index):
     # Eleven single-probe newcomers, each far faster but a weaker tier.
     newcomers = [f"vendor/newcomer-{i:02d}-3b" for i in range(11)]
     for m in newcomers:
+        index.ensure_model(m)
         index.record(m, "consolidation", "probe", "ok", 500.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -807,8 +857,14 @@ def test_thin_evidence_still_cannot_outrank_a_better_proven_model(index):
     import random
     rnd = random.Random(5)
     for _ in range(20):
+        index.ensure_model("openai/gpt-oss-120b")
+        index.ensure_model("openai/gpt-oss-120b")
+        index.ensure_model("openai/gpt-oss-120b")
         index.record("openai/gpt-oss-120b", "retain", "request", "ok",
                      rnd.uniform(3_000, 9_000), 12_000)
+    index.ensure_model("meta/llama-3.1-8b-instruct")
+    index.ensure_model("meta/llama-3.1-8b-instruct")
+    index.ensure_model("meta/llama-3.1-8b-instruct")
     index.record("meta/llama-3.1-8b-instruct", "retain", "probe", "ok", 400.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())
@@ -832,6 +888,7 @@ def test_exact_ties_break_deterministically_not_by_insertion_order(index):
     a, b = "nvidia/tie-one-31b", "nvidia/tie-two-31b"
     for mid in (a, b):
         for _ in range(10):
+            index.ensure_model(mid)
             index.record(mid, "consolidation", "request", "ok", 5_000.0, 12_000)
 
     r = Router(index, "https://x/v1", "k", RouterConfig())

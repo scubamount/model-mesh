@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import threading
 import time
 from pathlib import Path
@@ -93,7 +92,7 @@ async def chat_completions(request: Request):
     # a retain was in flight.
     if alias is None:
         payload, att = await asyncio.to_thread(
-            ROUTER._call, model, body, "generic", "request"
+            ROUTER.dial, model, body, "generic", "request"
         )
         if payload is not None:
             return JSONResponse(payload)
@@ -160,7 +159,7 @@ async def health():
     for alias, cfg in CFG["aliases"].items():
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
         oc = cfg.get("op_class", "retain")
-        healthy = [m for m in pool if ROUTER._eligible(m, oc)]
+        healthy = [m for m in pool if ROUTER.eligible(m, oc)]
         if not healthy:
             problems[alias] = "no healthy candidates"
 
@@ -224,8 +223,8 @@ async def mesh_status():
             # daemon and inferring from behavior. A value that decides routing
             # has to be inspectable here, same rule as rank_inputs above.
             "timeouts": {
-                "request_timeout_s": ROUTER._request_timeout(oc),
-                "probe_timeout_s": ROUTER._probe_timeout(oc),
+                "request_timeout_s": ROUTER.request_timeout(oc),
+                "probe_timeout_s": ROUTER.probe_timeout(oc),
             },
         }
     return out

@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
 import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from .index import FIDELITY_FAIL_STATUS, Index, OK
 from .opclass import check_fidelity, parse_content
@@ -112,9 +111,9 @@ class RouterConfig:
     # 96.9s and stayed ranked #2 on retain, so two attempts exhausted the 240s
     # budget and the op wedged until the watchdog reset it (2026-08-07).
     # Default 75s: an attempt must be able to run twice inside total_budget_s
-    # (2 x 75 = 150 < 240) so the cascade always has a real second try left.
-    # Raise it only if total_budget_s rises too — audit-timeout-chain.py checks
-    # the relationship.
+    # (2 x 75 = 150 < 280) so the cascade always has a real second try left.
+    # Raise it only if total_budget_s rises too —
+    # test_config_defaults_match_dataclass pins these defaults together.
     max_p95_ms_for_eligibility: float = 75_000.0
     # Last-resort sweep. The main loop dials ranked[:max_attempts]. On total
     # miss the re-probe arm PROBES down the whole list, but pays one probe
@@ -143,8 +142,8 @@ class RouterConfig:
     # (3 x 90 = 270 < 280) where 240 fit only 2. Headroom to the 300s client
     # timeout stays 20s. Raising this above ~295 would let the cascade outlive
     # the client, which silently discards the write mid-failover — the exact
-    # failure this budget exists to prevent. audit-timeout-chain.py asserts
-    # total_budget_s < RETAIN_LLM_TIMEOUT and REFLECT_LLM_TIMEOUT.
+    # failure this budget exists to prevent. Keep it under the calling
+    # client's own timeout; the README's config section states the rule.
     total_budget_s: float = 280.0
     # p95 at or above this means "overloaded", not "slow model". On free shared
     # NIM endpoints latency tracks how many OTHER people are hitting a model
@@ -234,22 +233,22 @@ class Router:
 
     # -- breaker ------------------------------------------------------------
 
-    def _request_timeout(self, op_class: Optional[str]) -> float:
+    def request_timeout(self, op_class: Optional[str]) -> float:
         """The request budget for one op_class.
 
-        Single predicate for BOTH timeouts (see _probe_timeout below): every
+        Single predicate for BOTH timeouts (see probe_timeout below): every
         call site routes through these two, so an op_class cannot end up with
         a per-class probe budget and a retain-tuned request budget.
         """
         return self.cfg.request_timeout_s_by_op_class.get(
             op_class, self.cfg.request_timeout_s)
 
-    def _probe_timeout(self, op_class: Optional[str]) -> float:
-        """The probe budget for one op_class. See _request_timeout."""
+    def probe_timeout(self, op_class: Optional[str]) -> float:
+        """The probe budget for one op_class. See request_timeout."""
         return self.cfg.probe_timeout_s_by_op_class.get(
             op_class, self.cfg.probe_timeout_s)
 
-    def _eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
+    def eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
         if b["state"] == "gone":
             return False
@@ -316,7 +315,7 @@ class Router:
             # Requiring a success in the window keeps this to the alternating
             # case and leaves an all-failure run to the breaker.
             #
-            # Not an eviction: probes bypass _eligible(), so a model that
+            # Not an eviction: probes bypass eligible(), so a model that
             # recovers earns samples back and returns on its own.
             if s is not None and s.n < self.cfg.min_samples_for_floor:
                 failures = round(s.n * (1.0 - s.success_rate))
@@ -366,7 +365,7 @@ class Router:
 
     # -- single upstream call ----------------------------------------------
 
-    def _call(
+    def dial(
         self, model_id: str, body: dict, op_class: str, source: str,
         timeout: Optional[float] = None, request_id: Optional[str] = None,
     ) -> tuple[Optional[dict], Attempt]:
@@ -383,7 +382,7 @@ class Router:
         t0 = time.monotonic()
         status_code, payload = self._transport(
             url, upstream_body, headers,
-            timeout or self._request_timeout(op_class)
+            timeout or self.request_timeout(op_class)
         )
         ms = (time.monotonic() - t0) * 1000.0
 
@@ -398,7 +397,7 @@ class Router:
             # changes is the evidence — the sample reads fidelity-fail, so the
             # success-rate floor demotes the model and two violations without
             # an intervening success drop it from the cascade entirely
-            # (_eligible / unrebutted_fidelity_fails).
+            # (eligible / unrebutted_fidelity_fails).
             ok, why = check_fidelity(payload, op_class)
             if not ok:
                 self.index.record(model_id, op_class, source,
@@ -502,7 +501,7 @@ class Router:
         """
         eligible = []
         for m in candidates:
-            if not self._eligible(m, op_class):
+            if not self.eligible(m, op_class):
                 continue
             eligible.append((m, self.index.score(m, op_class)))
         eligible.sort(
@@ -518,9 +517,9 @@ class Router:
         self, model_id: str, op_class: str, messages: list[dict],
         timeout: Optional[float] = None,
     ) -> bool:
-        """Back-compat boolean probe. Prefer probe_verdict() — a bare bool
-        cannot distinguish "this model cannot do the job" from "this model was
-        busy just now"."""
+        """Boolean convenience over probe_verdict for the re-probe arm, which
+        only cares "did it answer AND obey". Never use where busy-vs-unusable
+        matters — that distinction is the whole point of the verdict form."""
         return self.probe_verdict(model_id, op_class, messages, timeout)[0] == "pass"
 
     def probe_verdict(
@@ -550,15 +549,15 @@ class Router:
             "temperature": 0,
             "stream": False,
         }
-        payload, att = self._call(
+        payload, att = self.dial(
             model_id, body, op_class, source="probe",
-            timeout=timeout or self._probe_timeout(op_class),
+            timeout=timeout or self.probe_timeout(op_class),
         )
         if payload is None or att.status != OK:
             status = str(att.status or "")
             if status in ("http-404", "http-410"):
                 return "unusable", f"not servable ({status})"
-            # The fidelity gate inside _call already classified a
+            # The fidelity gate inside dial already classified a
             # broken-JSON/empty-content 200 as FIDELITY_FAIL_STATUS and
             # recorded the sample — a capability signal, same family as an
             # http reject, never "busy" (the pre-gate behaviour here called
@@ -571,7 +570,7 @@ class Router:
             # identical answer. Calling it `busy` (the pre-2026-08-08 behaviour)
             # meant a model that can never serve this op_class was re-probed on
             # every pass and stayed eligible for real traffic. It is recorded
-            # per-op_class by _call, so `unrebutted_reject` gates it — but it is
+            # per-op_class by dial, so `unrebutted_reject` gates it — but it is
             # NOT mark_gone: the model may serve other op_classes perfectly
             # (nemotron-mini-4b only fails because 4096 completion tokens
             # exceeds its whole context, which is a per-request-shape fact).
@@ -580,7 +579,7 @@ class Router:
             return "busy", f"{status}: {str(att.detail or '')[:120]}"
 
         # A 200 that reaches this line already passed the fidelity gate inside
-        # _call — re-running check_fidelity here would re-derive a decision
+        # dial — re-running check_fidelity here would re-derive a decision
         # the sample log already holds (and could disagree with it).
         return "pass", ""
 
@@ -609,9 +608,9 @@ class Router:
             the client would receive output its own parser rejects. This one
             predicate is the whole cascade — main loop and re-probe retries
             share it, so neither arm can drift into accepting prose."""
-            payload, att = self._call(
+            payload, att = self.dial(
                 mid, body, op_class, source=source,
-                timeout=min(self._request_timeout(op_class), _remaining()),
+                timeout=min(self.request_timeout(op_class), _remaining()),
                 request_id=request_id,
             )
             result.attempts.append(att)   # telemetry: EVERY dial is recorded
@@ -667,7 +666,7 @@ class Router:
                 if b["state"] == "gone":
                     continue
                 if self.probe(model_id, op_class, probe_messages,
-                              timeout=min(self._probe_timeout(op_class),
+                              timeout=min(self.probe_timeout(op_class),
                                           _remaining(), _box_left())):
                     fresh.append(model_id)
             reprobed_any = bool(fresh)
@@ -720,16 +719,16 @@ class Router:
                                 "cascade budget exhausted")
                     )
                     break
-                payload, att = self._call(
+                payload, att = self.dial(
                     model_id, body, op_class, source="sweep",
-                    timeout=min(self._request_timeout(op_class), left),
+                    timeout=min(self.request_timeout(op_class), left),
                     request_id=request_id,
                 )
                 result.attempts.append(att)   # EVERY dial is recorded
                 swept_any = True
                 swept_count += 1
                 if payload is not None and att.status == OK:
-                    # Fidelity gate already ran inside _call: a 200 here is a
+                    # Fidelity gate already ran inside dial: a 200 here is a
                     # contract-obeying answer, same guarantee as every arm.
                     result.swept = True
                     result.ok, result.model_id, result.response = (

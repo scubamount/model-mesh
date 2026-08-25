@@ -20,7 +20,9 @@ def _index(tmp_path):
 def test_record_persists_request_id(tmp_path):
     idx = _index(tmp_path)
     rid = uuid.uuid4().hex
+    idx.ensure_model("m/a")
     idx.record("m/a", "retain", "request", "http-598", 90000.0, request_id=rid)
+    idx.ensure_model("m/b")
     idx.record("m/b", "retain", "request", "ok", 1200.0, request_id=rid)
 
     rows = idx._conn.execute(
@@ -34,11 +36,15 @@ def test_one_failed_attempt_does_not_make_a_failed_request(tmp_path):
     idx = _index(tmp_path)
     rid = uuid.uuid4().hex
     # one cascade: first model times out, second succeeds -> CLIENT SUCCEEDED
+    idx.ensure_model("m/slow")
     idx.record("m/slow", "retain", "request", "http-598", 90000.0, request_id=rid)
+    idx.ensure_model("m/fast")
     idx.record("m/fast", "retain", "request", "ok", 900.0, request_id=rid)
     # an unrelated concurrent request that also failed once then succeeded
     rid2 = uuid.uuid4().hex
+    idx.ensure_model("m/slow")
     idx.record("m/slow", "retain", "request", "http-598", 90000.0, request_id=rid2)
+    idx.ensure_model("m/fast")
     idx.record("m/fast", "retain", "request", "ok", 950.0, request_id=rid2)
 
     rows = idx._conn.execute(

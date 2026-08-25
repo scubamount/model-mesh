@@ -41,6 +41,9 @@ def _router(idx, **cfg) -> Router:
 
 
 def _sample(idx, mid, oc, latency_ms, status=OK, n=1):
+    # In production every sampled id is already catalog-listed; tests must
+    # reproduce that precondition explicitly (record() refuses phantoms).
+    idx.ensure_model(mid)
     for _ in range(n):
         idx.record(mid, oc, "probe", status, latency_ms)
 

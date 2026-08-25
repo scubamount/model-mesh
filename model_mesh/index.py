@@ -70,7 +70,7 @@ CONFIDENT_N = 8
 
 # Statuses that mean "the provider understood the request and refused it" — a
 # deterministic capability verdict, not a transient failure. Recorded by
-# Router._call as http-<code>. Router derives its own copy from REJECT_CODES
+# Router.dial as http-<code>. Router derives its own copy from REJECT_CODES
 # and a test asserts the two agree, because router imports index (not the
 # reverse) and duplicating the set silently is how these drift.
 REJECT_STATUSES = ("http-400", "http-413", "http-422")
@@ -80,7 +80,7 @@ REJECT_STATUSES = ("http-400", "http-413", "http-422")
 # us, so the model is up — but a memory backbone cannot consume prose, and
 # counting it as a success taught the ranking that the worst-behaved model was
 # the best one. Recorded as a failed sample so every existing floor sees it;
-# gated separately in Router._eligible because, unlike an http reject, a
+# gated separately in Router.eligible because, unlike an http reject, a
 # fidelity failure can be stochastic and deserves its own evidence rule.
 FIDELITY_FAIL_STATUS = "fidelity-fail"
 
@@ -221,14 +221,24 @@ class Index:
         return {"new": new, "eol": eol, "returned": returned}
 
     def mark_gone(self, model_id: str, reason: str) -> None:
-        """Request-time EOL: a 404/410 means gone NOW, not at next discovery."""
+        """Request-time EOL: a 404/410 means gone NOW, not at next discovery.
+
+        Only for models the catalog has actually seen. A client can POST any
+        string as `model`; marking an unknown id gone wrote a breaker row (and
+        samples) for something that was never servable and never will be, so
+        `/mesh/status` reported phantom breakers forever — live-verified with
+        `auto/nonexistent` (audit 2026-08-25). Unknown ids are refused here;
+        the 404 the caller already returned is the whole truth about them.
+        """
         now = time.time()
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE models SET eol_at=COALESCE(eol_at, ?), eol_reason=?"
                 " WHERE id=?",
                 (now, reason, model_id),
             )
+            if cur.rowcount == 0:
+                return
             self._set_breaker_locked(model_id, "gone", 0, 0, now)
             self._conn.commit()
 
@@ -265,6 +275,16 @@ class Index:
         surrounded by 40+ successes from other requests.
         """
         with self._lock:
+            # Refuse samples for ids the catalog never listed. Every writer here
+            # is the mesh itself (cascade dials, probes, raw-id passthrough), so
+            # a sample for an unknown id means a client invented a model name —
+            # recording it created orphan rows no reader could interpret (the
+            # `auto/nonexistent` pollution, audit 2026-08-25). Known-but-EOL ids
+            # still record: their history is exactly what a weekly recheck needs.
+            # Tests seed fixtures through ensure_model() (or sync_catalog), which
+            # is the same gate production passes on its own writers.
+            if not self._known_locked(model_id):
+                return
             self._conn.execute(
                 "INSERT INTO samples (model_id, ts, op_class, source, latency_ms,"
                 " status, payload_chars, request_id) VALUES (?,?,?,?,?,?,?,?)",
@@ -272,6 +292,32 @@ class Index:
                  payload_chars, request_id),
             )
             self._conn.commit()
+
+    def _known_locked(self, model_id: str) -> bool:
+        """Caller holds the lock. One existence check, shared by the guards."""
+        return self._conn.execute(
+            "SELECT 1 FROM models WHERE id=?", (model_id,)
+        ).fetchone() is not None
+
+    def ensure_model(self, model_id: str, provider: str = "nim") -> None:
+        """Register a model id without evidence, as the catalog sync would.
+
+        Production never calls this — discovery's sync_catalog() is the only
+        legitimate writer to `models`. It exists for TESTS, which build Index
+        fixtures by recording samples for ids that in production would already
+        be in the catalog; with record()'s unknown-id guard those fixtures went
+        silently empty (25 tests red, audit 2026-08-25). Seeding must be
+        explicit so a test cannot accidentally measure a phantom.
+        """
+        now = time.time()
+        with self._lock:
+            if not self._known_locked(model_id):
+                self._conn.execute(
+                    "INSERT INTO models (id, provider, first_seen, last_seen)"
+                    " VALUES (?,?,?,?)",
+                    (model_id, provider, now, now),
+                )
+                self._conn.commit()
 
     def last_sample_ts(self, model_id: str, op_class: str) -> float:
         with self._lock:
