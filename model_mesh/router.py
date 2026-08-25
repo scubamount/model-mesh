@@ -254,16 +254,17 @@ class Router:
             return False
         if b["state"] == "auth":
             # Retry-after-cooldown, not terminal: see auth_cooldown_s.
-            if time.time() >= b["cooldown_until"]:
-                self.index.breaker_set(model_id, state="recovering")
-                return True
-            return False
+            # READ-ONLY here: this method is called by ranked() (the
+            # /mesh/status path) and /health — a status poll must not mutate
+            # the breaker table. The actual flip to `recovering` happens in
+            # dial() at attempt time (see _transition_for_attempt).
+            return time.time() >= b["cooldown_until"]
         if b["state"] == "down":
-            if time.time() >= b["cooldown_until"]:
-                # cooldown expired -> recovering: admit one real request
-                self.index.breaker_set(model_id, state="recovering")
-                return True
-            return False
+            # Same read-only rule. A `down` model whose cooldown has expired is
+            # still ranked/eligible (the cascade will retry it), but the
+            # transition is deferred to the real dial so introspection stays
+            # side-effect-free.
+            return time.time() >= b["cooldown_until"]
         # Sustained-failure floor: catches the intermittent model the
         # consecutive-fail breaker structurally cannot (ok/fail alternating
         # never reaches `breaker_threshold` in a row).
@@ -365,10 +366,33 @@ class Router:
 
     # -- single upstream call ----------------------------------------------
 
+    def _transition_for_attempt(self, model_id: str) -> None:
+        """Recover `down`/`auth` models whose cooldown has expired, at attempt
+        time only.
+
+        This is the ONE place a recovery-window transition happens. It used to
+        live inside eligible(), which ranked() (/mesh/status) and /health also
+        call — so every status poll or health check mutated the breaker table
+        (audit 2026-08-25). Ranking must still ADMIT an expired-cooldown model
+        (eligible() returns True for it), but the state flip now waits for the
+        real dial so introspection endpoints stay read-only.
+        """
+        b = self.index.breaker_get(model_id)
+        if b["state"] in ("down", "auth") and time.time() >= b["cooldown_until"]:
+            self.index.breaker_set(model_id, state="recovering")
+
     def dial(
         self, model_id: str, body: dict, op_class: str, source: str,
         timeout: Optional[float] = None, request_id: Optional[str] = None,
     ) -> tuple[Optional[dict], Attempt]:
+        # Flip a `down`/`auth` model whose cooldown has expired to
+        # `recovering` HERE — at attempt time, not at rank/status time.
+        # eligible() is read-only (called by ranked() and /health), so the
+        # recovery-window transition must live on the one path every real
+        # request shares. audit 2026-08-25: /mesh/status and /health used to
+        # call eligible() and thereby flipped breaker state on every poll — a
+        # read API that wrote. See _transition_for_attempt.
+        self._transition_for_attempt(model_id)
         url = self.upstream_base + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
