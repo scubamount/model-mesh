@@ -113,9 +113,9 @@ DEFAULTS: dict = {
         # Must satisfy 2 * this < total_budget_s so a slow model can't consume
         # the cascade; audit-timeout-chain.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,
-        # Under hindsight's 300s RETAIN_LLM_TIMEOUT so the client never abandons
-        # mid-cascade (see 060-hindsight-setup.sh). 280 fits 3 full-price 90s
-        # timeouts (270 < 280) and keeps 20s headroom to the client.
+        # Keep this UNDER the calling client's own timeout so the client never
+        # abandons the request mid-cascade. 280 fits 3 full-price 90s attempts
+        # (270 < 280) and leaves 20s headroom to a 300s client deadline.
         "total_budget_s": 280.0,
         # p95 at/above this = overloaded, demoted below healthy regardless of
         # quality tier; free re-promotion when measured p95 recovers.
@@ -192,11 +192,19 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     return cfg
 
 
-# Fallback file for the provider key. `launchctl setenv` does NOT survive a
-# machine restart, so the launchd daemon can come up with an empty key and 401
-# every call. Reading this file as a fallback (at call time, not import time)
-# makes that self-healing instead of an operator page.
-KEY_FALLBACK_FILE = Path(os.path.expanduser("~/.hermes/.env"))
+# Fallback file for the provider key. A launchd daemon does not inherit your
+# interactive shell env, and `launchctl setenv` does not survive a machine
+# restart, so the daemon can come up with an empty key and 401 every call.
+# Reading a file as a fallback (at call time, not import time) makes that
+# self-healing instead of an operator page. Override with
+# MODEL_MESH_KEY_FALLBACK_FILE; default is `<state dir>/.env` next to mesh.db,
+# holding lines of `ENV_VAR=value`.
+KEY_FALLBACK_FILE = Path(
+    os.environ.get(
+        "MODEL_MESH_KEY_FALLBACK_FILE",
+        str(Path(DEFAULTS["db_path"]).expanduser().parent / ".env"),
+    )
+)
 
 
 def resolve_api_key(env_var: str, fallback: Path = KEY_FALLBACK_FILE) -> str:

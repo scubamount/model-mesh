@@ -1,7 +1,7 @@
 """model-mesh daemon: OpenAI-compatible endpoint + mesh introspection API.
 
-Listens on 127.0.0.1:8002 (nim-proxy keeps :8001 until cutover). Aliases like
-auto/retain resolve through the index-ranked cascade; raw model ids pass
+Listens on the configured `listen` address (default 127.0.0.1:8002). Aliases
+like auto/retain resolve through the index-ranked cascade; raw model ids pass
 through with breaker protection and telemetry but no cascade.
 
 /health is DEEP: it fails (503) unless the upstream catalog is reachable AND
@@ -44,9 +44,18 @@ _BUCKET_NAMES = {
 
 CFG = load_config()
 INDEX = Index(CFG["db_path"])
+
+
+def _state_dir() -> Path:
+    """The directory holding mesh.db — the mesh's whole state dir (db, logs,
+    audit trail). Derived from db_path so relocating state is a config edit,
+    not a code change."""
+    return Path(CFG["db_path"]).expanduser().parent
+
 # Key resolver, not a cached string: read at CALL time from env, falling back
-# to ~/.hermes/.env. `launchctl setenv` does not survive a machine restart, so a
-# cached-at-import key meant the daemon 401'd every call until someone noticed.
+# to the state dir's .env file (see config.KEY_FALLBACK_FILE). `launchctl
+# setenv` does not survive a machine restart, so a cached-at-import key meant
+# the daemon 401'd every call until someone noticed.
 def _api_key() -> str:
     return resolve_api_key(CFG["provider"]["api_key_env"])
 
@@ -239,7 +248,9 @@ async def mesh_probe():
     """
     if not _DISCOVERY_LOCK.acquire(blocking=False):
         return JSONResponse({"status": "already running"}, status_code=429)
-    audit = Path(os.path.expanduser("~/.model-mesh/audit")) / "discovery.jsonl"
+    # Audit trail lives in the SAME state directory as mesh.db — one dir holds
+    # everything an operator must back up.
+    audit = _state_dir() / "audit" / "discovery.jsonl"
     started = time.time()
     try:
         _disc = CFG.get("discovery") or {}

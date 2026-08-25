@@ -3,8 +3,8 @@
 **One local OpenAI-compatible endpoint that never dies.**
 
 A health-aware model router for NVIDIA NIM (and any OpenAI-compatible upstream).
-Replaces `scubamount-nim-proxy` + its hourly auto-ranker with request-time
-routing built on a persistent model index.
+Replaces a static proxy + hourly auto-ranker with request-time routing built on
+a persistent model index.
 
 ## Why (the failure that motivated this)
 
@@ -269,9 +269,9 @@ OpenAI-compatible localhost port.
 traffic all flow through the mesh, with a litellm fallback tier to a pinned
 `openai/gpt-oss-20b` on the same port.
 
-`auto/evolve` serves DSPy skill evolution (hermes-agent-self-evolution) on its
-own `evolve` op_class — scores are per-op_class, so evolution traffic must not
-vote in the ranking that picks hindsight's memory models.
+`auto/evolve` serves DSPy-style skill evolution on its own `evolve` op_class —
+scores are per-op_class, so evolution traffic must not vote in the ranking that
+picks the memory models.
 
 ## Non-goals (v1)
 
@@ -282,25 +282,34 @@ vote in the ranking that picks hindsight's memory models.
 
 ## Ops
 
-- `scripts/install-launchd.sh` — daemon + daily discovery job. launchd labels:
-  `com.scubamount.model-mesh` (daemon, KeepAlive) and
-  `com.scubamount.model-mesh-discover` (06:15 daily). Restart after code
-  changes: `launchctl kickstart -k gui/$(id -u)/com.scubamount.model-mesh`.
-- Runs on `127.0.0.1:8002`.
-- Logs: daemon log, discovery log, and audit JSONL — all under the state
-  directory (see `db_path` in `model_mesh/config.py`).
-- Tests: `.venv/bin/python -m pytest tests/` (131 tests; includes a sabotage
-  matrix proving each routing guarantee fails loudly when its mechanism is
-  removed).
-- State: everything under the state directory — copy the dir, keep the
-  history (portable to other machines by design).
-- **Backups.** `mesh.db` is *learned* state: sample history, breaker states
-  and EOL marks accumulated from real traffic, reconstructible only by
-  re-living that time. It is not in git and nothing here regenerates it. It
-  is backed up by the durable-state backup script in the hermes-agent-patches
-  repo (sqlite `.backup`, WAL-safe), which runs as an `/aaa` step gated by a
-  backup-*freshness* invariant. A running daemon is not a backup: uptime
-  reads as safety, which is why this had none for months.
+- `scripts/install-launchd.sh` — installs the daemon + daily discovery job as
+  launchd user agents (macOS). Everything site-specific is an environment
+  variable, defaulted for a fresh install:
+
+  | var | default | what it sets |
+  |---|---|---|
+  | `MESH_LABEL_PREFIX` | `local` | reverse-DNS prefix for both launchd labels |
+  | `MESH_HOST` / `MESH_PORT` | `127.0.0.1` / `8002` | listen address |
+  | `MESH_HOME` | `~/.model-mesh` | state dir: db, logs, audit trail |
+  | `MESH_PYTHON` | first `python3.12+` on `PATH` | interpreter used to build the venv |
+  | `MESH_DISCOVER_HOUR` / `_MIN` | `6` / `15` | daily discovery time |
+
+  Restart after code changes:
+  `launchctl kickstart -k gui/$(id -u)/<prefix>.model-mesh`.
+- **Provider key.** Never written to a plist or a repo file. The daemon reads
+  `$NVIDIA_API_KEY` at *call* time and falls back to `$MESH_HOME/.env` (lines of
+  `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
+  the file is the durable option; override its path with
+  `MODEL_MESH_KEY_FALLBACK_FILE`.
+- Logs and the audit JSONL live under the state directory, derived from
+  `db_path` — relocating state is a config edit, not a code change.
+- Tests: `.venv/bin/python -m pytest` (155 tests; includes a sabotage matrix
+  proving each routing guarantee fails loudly when its mechanism is removed).
+- **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
+  EOL marks accumulated from real traffic, reconstructible only by re-living
+  that time. It is not in git and nothing here regenerates it — back it up with
+  sqlite `.backup` (WAL-safe) on a schedule. A running daemon is not a backup:
+  uptime reads as safety, which is why this had none for months.
 
 ## License
 

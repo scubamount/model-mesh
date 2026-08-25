@@ -39,7 +39,7 @@ def test_consolidation_empty_envelope_is_success():
 
 def test_consolidation_populated_envelope_is_success():
     body = json.dumps({
-        "creates": [{"text": "Andrew runs model-mesh on 8002.",
+        "creates": [{"text": "The user runs model-mesh locally.",
                      "source_fact_ids": ["7eb6ca3c"]}],
         "updates": [], "deletes": [],
     })

@@ -173,7 +173,7 @@ def test_unknown_models_rank_after_scored_but_stay(index):
 
 def test_total_miss_reprobe_rescues(index):
     """All ranked candidates fail; a live re-probe finds m3 healthy and the
-    request succeeds instead of 503ing. This is the arm Scubamount asked for."""
+    request succeeds instead of 503ing. This is the arm the operator asked for."""
     script = {
         "m1": [(500, {})] * 4,   # keep failing through the re-probe too
         "m2": [(500, {})] * 4,

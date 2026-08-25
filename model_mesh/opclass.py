@@ -20,7 +20,7 @@ RETAIN_MESSAGES = [
             'object of the form {"facts": ["fact1", "fact2"]}. No prose, no markdown.'
         ),
     },
-    {"role": "user", "content": "Scubamount dives in Monterey and prefers a 7mm wetsuit."},
+    {"role": "user", "content": "The user dives in Monterey Bay and prefers a 7mm wetsuit."},
 ]
 
 CONSOLIDATION_MESSAGES = [
@@ -43,7 +43,7 @@ CONSOLIDATION_MESSAGES = [
     {
         "role": "user",
         "content": json.dumps(
-            {"facts": [{"text": "Scubamount logged a 30m dive.",
+            {"facts": [{"text": "The user logged a 30m dive.",
                         "context": "conversation between agent and user"}],
              "observations": []}
         ),
@@ -64,7 +64,7 @@ EVOLVE_MESSAGES = [
         "role": "user",
         "content": (
             "Skill: verify a daemon is healthy before routing traffic to it.\n"
-            "Task: the daemon on port 8002 just restarted — what do you do?"
+            "Task: the daemon just restarted — what do you do?"
         ),
     },
 ]
