@@ -1,8 +1,13 @@
 """model-mesh config loader.
 
-YAML at ~/.model-mesh/config.yaml; sane NIM defaults ship in-code so the
-daemon boots with zero config. Secrets come from env vars named in config —
-never stored in the file or the DB.
+YAML at `<state dir>/config.yaml`; sane NIM defaults ship in-code so the daemon
+boots with zero config. Secrets come from env vars named in config — never
+stored in the file or the DB.
+
+The state directory is `$MESH_HOME` (default `~/.model-mesh`) and holds
+everything an operator must back up: mesh.db, config.yaml, the key fallback
+`.env`, logs, and the audit trail. One env var relocates the whole install, so
+a second copy on the same machine cannot silently share the first one's state.
 """
 
 from __future__ import annotations
@@ -15,7 +20,11 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
-CONFIG_PATH = Path(os.path.expanduser("~/.model-mesh/config.yaml"))
+# The state directory: one env var relocates db, config, key fallback, logs and
+# audit trail together. Everything else derives from this, so there is no way to
+# move half an install.
+STATE_DIR = Path(os.environ.get("MESH_HOME", "~/.model-mesh")).expanduser()
+CONFIG_PATH = STATE_DIR / "config.yaml"
 
 # Substrings identifying models that CANNOT serve a JSON-emitting text op_class:
 # other modalities (vision/audio/video/image-gen), non-generative heads
@@ -46,7 +55,7 @@ _NON_TEXT = [
 ]
 
 DEFAULTS: dict = {
-    "db_path": "~/.model-mesh/mesh.db",
+    "db_path": str(STATE_DIR / "mesh.db"),
     "listen": {"host": "127.0.0.1", "port": 8002},
     "provider": {
         "name": "nim",
@@ -196,15 +205,12 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
 # interactive shell env, and `launchctl setenv` does not survive a machine
 # restart, so the daemon can come up with an empty key and 401 every call.
 # Reading a file as a fallback (at call time, not import time) makes that
-# self-healing instead of an operator page. Override with
-# MODEL_MESH_KEY_FALLBACK_FILE; default is `<state dir>/.env` next to mesh.db,
-# holding lines of `ENV_VAR=value`.
+# self-healing instead of an operator page. Lives in the state dir beside the
+# db; override the file itself with MODEL_MESH_KEY_FALLBACK_FILE. Holds lines of
+# `ENV_VAR=value`, mode 0600.
 KEY_FALLBACK_FILE = Path(
-    os.environ.get(
-        "MODEL_MESH_KEY_FALLBACK_FILE",
-        str(Path(DEFAULTS["db_path"]).expanduser().parent / ".env"),
-    )
-)
+    os.environ.get("MODEL_MESH_KEY_FALLBACK_FILE", str(STATE_DIR / ".env"))
+).expanduser()
 
 
 def resolve_api_key(env_var: str, fallback: Path = KEY_FALLBACK_FILE) -> str:

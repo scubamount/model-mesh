@@ -292,8 +292,32 @@ def _audit(path: Path, record: dict) -> None:
 async def mesh_discovery(limit: int = 10):
     """Last N discovery outcomes. This is how you check the daily job actually
     ran and what it found — not by tailing a curl-owned log file."""
-    path = Path(os.path.expanduser("~/.model-mesh/audit")) / "discovery.jsonl"
+    path = _state_dir() / "audit" / "discovery.jsonl"
     if not path.is_file():
         return {"runs": [], "note": "no discovery has been recorded yet"}
     lines = path.read_text().strip().splitlines()[-limit:]
     return {"runs": [json.loads(x) for x in lines]}
+
+
+def main() -> None:
+    """Serve on the address in config. THE entrypoint — the launchd plist calls
+    this instead of passing `--host/--port` to uvicorn itself.
+
+    Reason: `listen` shipped in DEFAULTS while the plist hardcoded the address
+    on the uvicorn command line, so config said one thing and the running daemon
+    did another, and editing config.yaml moved nothing (audit 2026-08-25). One
+    source of truth, and it is the config.
+    """
+    import uvicorn
+
+    listen = CFG["listen"]
+    uvicorn.run(
+        app,
+        host=listen["host"],
+        port=int(listen["port"]),
+        access_log=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

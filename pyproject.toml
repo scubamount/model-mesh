@@ -14,5 +14,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
+[project.scripts]
+model-mesh = "model_mesh.app:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

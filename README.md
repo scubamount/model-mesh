@@ -283,27 +283,35 @@ picks the memory models.
 ## Ops
 
 - `scripts/install-launchd.sh` — installs the daemon + daily discovery job as
-  launchd user agents (macOS). Everything site-specific is an environment
-  variable, defaulted for a fresh install:
+  launchd user agents (macOS). **Idempotent and adoptive:** if an install
+  already exists it reuses that machine's label prefix and state directory, so
+  a reinstall updates your install rather than forking a second daemon onto the
+  same port and stranding the old `mesh.db`. A fresh machine gets `local.*` and
+  `~/.model-mesh`. Overrides, all optional:
 
   | var | default | what it sets |
   |---|---|---|
-  | `MESH_LABEL_PREFIX` | `local` | reverse-DNS prefix for both launchd labels |
-  | `MESH_HOST` / `MESH_PORT` | `127.0.0.1` / `8002` | listen address |
-  | `MESH_HOME` | `~/.model-mesh` | state dir: db, logs, audit trail |
+  | `MESH_HOME` | adopted, else `~/.model-mesh` | state dir: db, config, `.env`, logs, audit |
+  | `MESH_LABEL_PREFIX` | adopted, else `local` | reverse-DNS prefix for both launchd labels |
+  | `MESH_HOST` / `MESH_PORT` | `127.0.0.1` / `8002` | seeds `listen` in a new `config.yaml` |
   | `MESH_PYTHON` | first `python3.12+` on `PATH` | interpreter used to build the venv |
   | `MESH_DISCOVER_HOUR` / `_MIN` | `6` / `15` | daily discovery time |
 
   Restart after code changes:
   `launchctl kickstart -k gui/$(id -u)/<prefix>.model-mesh`.
+- **The listen address lives in `config.yaml`, not in the plist.** The agent runs
+  the `model-mesh` console entrypoint, which serves whatever `listen` says;
+  `MESH_HOST`/`MESH_PORT` only seed that file on first install and never clobber
+  an existing one. Change the address by editing config and restarting.
+- **One state directory.** `$MESH_HOME` (default `~/.model-mesh`) holds the db,
+  `config.yaml`, the key fallback `.env`, logs and the audit trail — they derive
+  from one root, so nothing can relocate half an install.
 - **Provider key.** Never written to a plist or a repo file. The daemon reads
   `$NVIDIA_API_KEY` at *call* time and falls back to `$MESH_HOME/.env` (lines of
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Logs and the audit JSONL live under the state directory, derived from
-  `db_path` — relocating state is a config edit, not a code change.
-- Tests: `.venv/bin/python -m pytest` (155 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (196 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
