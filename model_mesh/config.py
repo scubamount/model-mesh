@@ -64,8 +64,15 @@ DEFAULTS: dict = {
     },
     "router": {
         "breaker_threshold": 3,
-        "breaker_cooldown_s": 120.0,
-        "breaker_cooldown_max_s": 1800.0,
+        # 30s -> x2 -> 300s cap, per free-coding-models' field-proven breaker
+        # against these same NIM endpoints (v0.5.81 config.js:205-210).
+        # Overload flips within minutes; the old 120s->1800s ladder kept a
+        # recovered model benched up to 30min after a 2-minute episode.
+        "breaker_cooldown_s": 30.0,
+        "breaker_cooldown_max_s": 300.0,
+        # Provider-wide 429 pause (shared-key throttle; see RouterConfig).
+        "provider_pause_default_s": 5.0,
+        "provider_pause_max_s": 60.0,
         # Attempt count must not be the binding constraint — the real-time
         # budget should be. A 4xx reject costs 0.26s median, so three cheap
         # rejects used to end a cascade with ~99% of the budget unspent.

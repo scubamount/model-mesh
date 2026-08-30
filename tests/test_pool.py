@@ -822,7 +822,9 @@ def test_proven_model_is_not_evicted_by_unproven_ones(index):
         index.record(proven, "consolidation", "request", "ok", 3_000.0, 12_000)
 
     s = index.score(proven, "consolidation")
-    assert s.success_rate == 1.0 and s.n == 36
+    # SCORE_RECENT_N caps evidence at the newest 20 of the 36 samples —
+    # recency-capped scoring (2026-08-30); all are ok either way.
+    assert s.success_rate == 1.0 and s.n == 20
     assert s.p95_ms < RouterConfig().overload_p95_ms, (
         "precondition: the proven model must be HEALTHY, or it is demoted for "
         "being overloaded and the test proves nothing about eviction")

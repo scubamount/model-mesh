@@ -106,6 +106,16 @@ EOL_RECHECK_S = 7 * 86400.0
 # whichever model happens to carry live traffic.
 SCORE_WINDOW_S = 86400.0
 
+# Evidence cap inside the window: score over the NEWEST N samples only.
+# NIM overload flips in minutes, so a time-window average buries the last
+# hour's recovery (or collapse) under yesterday's 100+ samples — a model that
+# failed all morning but is serving now still read as failing for hours.
+# free-coding-models scores over its last 20 probes (v0.5.81) against these
+# same endpoints; a count window self-adapts to traffic rate and has no
+# empty-window edge case. SCORE_WINDOW_S stays as the staleness bound —
+# samples older than 24h say nothing about now, however few there are.
+SCORE_RECENT_N = 20
+
 
 @dataclass
 class Score:
@@ -410,7 +420,10 @@ class Index:
     def score(
         self, model_id: str, op_class: str, window_s: float = SCORE_WINDOW_S
     ) -> Optional[Score]:
-        """Measured evidence for one model on one op_class, over the window.
+        """Measured evidence for one model on one op_class: the newest
+        SCORE_RECENT_N samples inside the window (see SCORE_RECENT_N for why
+        recency caps the evidence — overload flips in minutes and a 24h
+        average buries the last hour).
 
         Returns the raw measurements — p95, jitter, spike-rate, success-rate,
         sample count — and does NOT reduce them to a single number. Ranking is
@@ -432,8 +445,9 @@ class Index:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT latency_ms, status FROM samples"
-                " WHERE model_id=? AND op_class=? AND ts>=?",
-                (model_id, op_class, cutoff),
+                " WHERE model_id=? AND op_class=? AND ts>=?"
+                " ORDER BY ts DESC LIMIT ?",
+                (model_id, op_class, cutoff, SCORE_RECENT_N),
             ).fetchall()
         if not rows:
             return None

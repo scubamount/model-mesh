@@ -45,8 +45,13 @@ REJECT_STATUS_NAMES = {f"http-{c}" for c in REJECT_CODES}
 @dataclass
 class RouterConfig:
     breaker_threshold: int = 3          # consecutive fails -> down
-    breaker_cooldown_s: float = 120.0   # first cooldown
-    breaker_cooldown_max_s: float = 1800.0
+    breaker_cooldown_s: float = 30.0    # first cooldown (FCM-proven ladder)
+    breaker_cooldown_max_s: float = 300.0
+    # Provider-wide 429 pause: NIM throttles the shared key, not one model.
+    # Default window when the 429 carries no Retry-After; cap bounds a
+    # hostile/buggy header so one response can't bench the whole mesh.
+    provider_pause_default_s: float = 5.0
+    provider_pause_max_s: float = 60.0
     # Attempt COUNT must not be the binding constraint — the budget should be.
     # Measured 2026-08-10: a deterministic 4xx reject costs 0.26s median, so a
     # cascade can afford many of them, while max_attempts=3 gave up after three
@@ -201,6 +206,13 @@ class Router:
         self._api_key = api_key if callable(api_key) else (lambda: api_key)
         self.cfg = cfg or RouterConfig()
         self._transport = transport or self._http_post
+        # Provider-wide 429 pause (epoch seconds). NIM throttles the shared
+        # API key, not one model, so a Retry-After applies to every sibling:
+        # dialing the next candidate during the window spends budget on a
+        # guaranteed 429 and pollutes its samples with our own throttle.
+        # free-coding-models pauses the entire provider the same way
+        # (v0.5.81 provider-cooldown.js:127-135, max-of-windows).
+        self._provider_pause_until = 0.0
 
     @property
     def api_key(self) -> str:
@@ -223,10 +235,24 @@ class Router:
                     # transient provider failure, never forward to the client.
                     return 599, {"error": "malformed upstream body"}
         except urllib.error.HTTPError as e:
+            payload: dict
             try:
                 payload = json.loads(e.read().decode())
             except Exception:
                 payload = {"error": str(e)}
+            if e.code == 429:
+                # Surface Retry-After to dial() WITHOUT changing the transport
+                # signature (tests inject (status, dict) transports). NIM's
+                # 429 is a statement about the shared API key, not one model:
+                # free-coding-models pauses the whole provider on it
+                # (v0.5.81 ping.js:186-189) and that matches the 40-rpm
+                # single-key budget here.
+                ra = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    if ra is not None:
+                        payload["_retry_after_s"] = max(0.0, float(ra))
+                except (TypeError, ValueError):
+                    pass  # HTTP-date form or garbage: no pause signal
             return e.code, payload
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             return 598, {"error": f"{type(e).__name__}: {e}"}
@@ -406,6 +432,22 @@ class Router:
         # call eligible() and thereby flipped breaker state on every poll — a
         # read API that wrote. See _transition_for_attempt.
         self._transition_for_attempt(model_id)
+        # Provider-wide throttle window: NIM said "stop asking" with a
+        # Retry-After. If the window outlives this attempt's budget, don't
+        # spend an upstream call on a guaranteed 429 — and don't record a
+        # sample, because a self-inflicted throttle hit is evidence about our
+        # request pacing, not about the model. If the window ends inside the
+        # budget, wait it out and dial with what remains.
+        budget = timeout or self.request_timeout(op_class)
+        pause_left = self._provider_pause_until - time.time()
+        if pause_left > 0:
+            if pause_left >= budget - 1.0:
+                return None, Attempt(
+                    model_id, "skipped-provider-pause", None,
+                    f"provider 429 Retry-After window: {pause_left:.1f}s left",
+                )
+            time.sleep(pause_left)
+            budget -= pause_left
         url = self.upstream_base + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -418,10 +460,25 @@ class Router:
         )
         t0 = time.monotonic()
         status_code, payload = self._transport(
-            url, upstream_body, headers,
-            timeout or self.request_timeout(op_class)
+            url, upstream_body, headers, budget
         )
         ms = (time.monotonic() - t0) * 1000.0
+
+        if status_code == 429:
+            # Arm the provider-wide pause. Retry-After is authoritative when
+            # present; without it, a short fixed window still stops the
+            # cascade from machine-gunning the shared key through its
+            # remaining candidates. max(): never shorten an armed window.
+            ra = payload.pop("_retry_after_s", None) if isinstance(payload, dict) else None
+            window = ra if ra is not None else self.cfg.provider_pause_default_s
+            window = min(float(window), self.cfg.provider_pause_max_s)
+            self._provider_pause_until = max(
+                self._provider_pause_until, time.time() + window
+            )
+            logger.warning(
+                "provider-pause armed: 429 on %s, window=%.1fs (retry-after=%s)",
+                model_id, window, ra,
+            )
 
         if status_code == 200:
             # Fidelity gate, enforced at the ONE place every response passes.

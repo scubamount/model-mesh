@@ -198,7 +198,8 @@ Status-code discipline:
 
 | code | meaning | action |
 |---|---|---|
-| 429 / 5xx / timeout | transient overload | cascade onward |
+| 429 | shared-key throttle | cascade onward + **provider-wide pause** (Retry-After honored, capped 60s; siblings skip, no sample recorded) |
+| 5xx / timeout | transient overload | cascade onward |
 | 401 / 403 | auth | separate state, expires; never poisons the breaker |
 | 400 / 413 / 422 | capability reject | excluded from that op_class |
 | 404 / 410 | **gone** | `eol_at` marked immediately — EOL detection at request time |
@@ -206,9 +207,9 @@ Status-code discipline:
 ### Circuit breaker
 
 Per model: `healthy → down` after N consecutive fails (default 3);
-`down → recovering` after cooldown (default 120s); `recovering` admits one
+`down → recovering` after cooldown (default 30s); `recovering` admits one
 real request — success closes the circuit, failure reopens with doubled
-cooldown (cap 30 min).
+cooldown (cap 5 min).
 
 ### Discovery (daily) + probe (adaptive)
 
@@ -259,9 +260,13 @@ unpredictably:
 - `GET /mesh/discovery` — recent discovery runs: timestamp, duration, and the
   `new`/`eol`/`returned`/`probed` sets per pass. The churn record the whole
   probe design exists for.
-- `GET /health` — **deep** health: catalog reachable AND ≥1 healthy model per
-  configured alias. Returns 503 otherwise. (The predecessor's `/health`
-  could not fail while retain was down; this one can.)
+- `GET /health` — **deep** health = *can the mesh serve*: `healthy` when ≥1
+  eligible model per alias; `degraded` (still 200) when the floors admit
+  nobody but the pool produced an OK inside 30 min — whole-pool overload is
+  NIM's steady state and the sweep backstop still serves through it; 503
+  only when nothing is admitted AND nothing recently served. (The
+  predecessor's `/health` could not fail while retain was down; the version
+  after that failed while retain was *serving*. This one tracks servability.)
 
 ### Config
 
@@ -305,7 +310,7 @@ Router knobs worth knowing:
 | `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
 | `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
 | `router.breaker_threshold` | `3` | consecutive fails before a model opens its breaker |
-| `router.breaker_cooldown_s` | `120` | first cooldown; doubles to `breaker_cooldown_max_s` (1800) |
+| `router.breaker_cooldown_s` | `30` | first cooldown; doubles to `breaker_cooldown_max_s` (300) |
 | `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` = whole pool |
 | `discovery.max_probes_per_pass` | `25` | hard ceiling per discovery pass |
 
@@ -363,7 +368,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (254 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (268 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living

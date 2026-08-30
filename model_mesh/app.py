@@ -41,6 +41,12 @@ _BUCKET_NAMES = {
     BUCKET_FAILING: "failing",
 }
 
+# /health "degraded" window: an OK anywhere in the pool this recent proves the
+# mesh can serve even when the floors admit nobody (sweep backstop). Sized to
+# hindsight's retain cadence — traffic arrives well inside 30 minutes, so a
+# window with no OK at all means requests are actually failing, not idle.
+HEALTH_SERVE_WINDOW_S = 1800.0
+
 CFG = load_config()
 INDEX = Index(CFG["db_path"])
 
@@ -144,8 +150,23 @@ async def models():
 
 @app.get("/health")
 async def health():
-    """Deep health: catalog reachable AND >=1 healthy candidate per alias."""
+    """Deep health = CAN THE MESH SERVE, not "do the floors admit somebody".
+
+    Whole-pool degradation is NIM's steady state, not an episode: any subset
+    of models can be overloaded at any minute. The floors correctly admitting
+    nobody does not mean requests fail — the last-resort sweep arm dials
+    floor-excluded models and measurably serves through them. Requiring an
+    ELIGIBLE candidate here reported "unhealthy" while real retain traffic
+    was returning 200s (observed 2026-08-30: /health 503 on all three
+    aliases; contract-valid serve via sweep in the same minute).
+
+    Per alias: healthy if any candidate is eligible; DEGRADED (still 200 —
+    the mesh serves) if none is eligible but something in the pool produced
+    an OK inside HEALTH_SERVE_WINDOW_S; unhealthy only when both are false —
+    nothing admitted AND nothing recently served, i.e. actually cannot serve.
+    """
     problems: dict[str, str] = {}
+    degraded: dict[str, str] = {}
     try:
         await asyncio.to_thread(
             fetch_catalog,
@@ -156,16 +177,30 @@ async def health():
     except Exception as e:  # noqa: BLE001
         problems["catalog"] = f"unreachable: {type(e).__name__}"
 
+    now = time.time()
     for alias, cfg in CFG["aliases"].items():
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
         oc = cfg.get("op_class", "retain")
-        healthy = [m for m in pool if ROUTER.eligible(m, oc)]
-        if not healthy:
-            problems[alias] = "no healthy candidates"
+        if any(ROUTER.eligible(m, oc) for m in pool):
+            continue
+        last_ok = max(
+            (INDEX.last_success_ts(m, oc) for m in pool), default=0.0
+        )
+        if now - last_ok <= HEALTH_SERVE_WINDOW_S:
+            degraded[alias] = (
+                f"no admitted candidate; last ok {now - last_ok:.0f}s ago "
+                "(sweep backstop serving)"
+            )
+        else:
+            problems[alias] = "cannot serve: no eligible candidate and no ok "\
+                f"in {HEALTH_SERVE_WINDOW_S:.0f}s"
 
     if problems:
-        return JSONResponse({"status": "unhealthy", "problems": problems},
-                            status_code=503)
+        return JSONResponse(
+            {"status": "unhealthy", "problems": problems, "degraded": degraded},
+            status_code=503)
+    if degraded:
+        return {"status": "degraded", "degraded": degraded}
     return {"status": "healthy"}
 
 

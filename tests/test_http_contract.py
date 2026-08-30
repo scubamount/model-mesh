@@ -71,17 +71,35 @@ def test_unknown_alias_is_honest_503_with_evidence(client):
     assert n == 0
 
 
-def test_health_deep_503_when_alias_has_no_healthy_candidate(client):
-    """Deep health: an alias whose every candidate is ineligible fails /health,
-    even though the catalog itself is reachable. This is THE property that
-    makes /health able to fail — the predecessor's could not."""
+def test_health_deep_503_when_alias_cannot_serve(client):
+    """Deep health: every candidate ineligible AND no recent ok anywhere in
+    the pool => the mesh actually cannot serve => 503. This is THE property
+    that makes /health able to fail — the predecessor's could not."""
     c, idx = client
     # Make m1 measurably failing: below success floor at floor-sample count.
     for _ in range(4):
         idx.record("m1", "retain", "request", "http-500", 1000.0)
     r = c.get("/health")
     assert r.status_code == 503
-    assert any("healthy" in p for p in r.json()["problems"].values())
+    assert any("cannot serve" in p for p in r.json()["problems"].values())
+
+
+def test_health_degraded_when_sweep_backstop_serving(client):
+    """Floors admit nobody, but the pool produced a recent ok (sweep arm):
+    the mesh IS serving, so /health must be 200/degraded, not 503. Whole-pool
+    overload is NIM's steady state — observed 2026-08-30: /health 503 on all
+    aliases while contract-valid retains returned 200 in the same minute."""
+    c, idx = client
+    # Recent ok first, then enough failures to fail the success floor
+    # (newest-N scoring: 1 ok + 19 fails = 5% < 50% floor => ineligible).
+    idx.record("m1", "retain", "request", "ok", 900.0)
+    for _ in range(19):
+        idx.record("m1", "retain", "request", "http-429", 500.0)
+    r = c.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert any("sweep backstop" in v for v in body["degraded"].values())
 
 
 def test_health_ok_with_a_serving_model(client):
