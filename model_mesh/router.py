@@ -8,6 +8,8 @@ Failure taxonomy (each class routes differently — collapsing them is how the
 predecessor silently lost redundancy):
 
   transient  429 / 5xx / timeout / malformed-JSON  -> breaker counts, cascade
+             (429 additionally arms a provider-wide pause: the throttle is
+              on the shared key, not the model — see dial())
   auth       401 / 403                             -> mark 'auth', skip provider, NO breaker poison
   gone       404 / 410                             -> index.mark_gone NOW, cascade
 """

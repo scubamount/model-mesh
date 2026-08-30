@@ -10,7 +10,10 @@ your request.
 
 Built for **free shared inference endpoints**, where models go overloaded for
 minutes, disappear for days, and get retired without warning while still being
-listed in the catalog.
+listed in the catalog — and where every request shares one rate-limited API
+key. Whole-pool degradation is the steady state here, not an incident: the
+design goal is that the mesh keeps serving *something* through it, preferring
+the best model that is up but never requiring any particular one.
 
 ## Quickstart
 
@@ -136,6 +139,14 @@ using it. Past `overload_p95_ms` (20s) a model drops below everything healthy
 whatever its tier, and is promoted back for free when its p95 recovers.
 Nothing marks or unmarks it.
 
+**Evidence is recency-capped.** `score()` reads the newest `SCORE_RECENT_N`
+(20) samples inside a 24h staleness bound — a count window, not a time
+window. Overload flips within minutes on these endpoints; a 24h average
+buried a recovery (or a fresh collapse) under yesterday's hundred samples
+for hours. A count window self-adapts to traffic rate and has no
+empty-window edge case; samples older than 24h still say nothing about now
+and score `None` (bucket `unknown`).
+
 **Quality tier** (1–5) is derived from the model id: parameter count, else a
 size adjective, else mid. That deliberately contradicts this codebase's rule
 against guessing capability from names, and the tension resolves on *which*
@@ -159,7 +170,7 @@ guessed:
   refused the request shape — deterministic, retry pointless. Excluded from
   the op_class after two occurrences; the model stays eligible for others.
 - **Success floor**: below `min_success_rate` (0.5) over `min_samples_for_floor`
-  (4) in-window samples, a model does not serve that op_class.
+  (4) recent samples, a model does not serve that op_class.
 - **Latency floor**: measured p95 above `max_p95_ms_for_eligibility` (75s)
   excludes the model — an attempt must be able to run twice inside the budget.
 
@@ -209,7 +220,27 @@ Status-code discipline:
 Per model: `healthy → down` after N consecutive fails (default 3);
 `down → recovering` after cooldown (default 30s); `recovering` admits one
 real request — success closes the circuit, failure reopens with doubled
-cooldown (cap 5 min).
+cooldown (cap 5 min). The 30s→300s ladder is adopted from
+free-coding-models' field-proven breaker against the same NIM endpoints:
+overload flips within minutes, and the previous 120s→30min ladder kept a
+recovered model benched long after a two-minute episode ended.
+
+### Provider-wide 429 pause
+
+A 429 from NIM is a statement about the **shared API key** (40 req/min),
+not about the model that happened to answer it. Cascading onward through
+the remaining candidates used to machine-gun the same throttled key — each
+sibling burned budget on a guaranteed 429 and polluted its own samples with
+a failure we inflicted. Now a 429 arms a router-wide pause window:
+
+- `Retry-After` is honored when present (capped at `provider_pause_max_s`,
+  60s), else `provider_pause_default_s` (5s); windows only ever extend
+  (max-of-windows), never shorten.
+- Inside the window, a dial whose budget cannot outlive the pause returns
+  `skipped-provider-pause` **without an upstream call and without recording
+  a sample** — a self-inflicted throttle hit is evidence about our pacing,
+  not about the model. A dial whose budget covers the pause waits it out
+  and proceeds with the remainder.
 
 ### Discovery (daily) + probe (adaptive)
 
@@ -311,6 +342,8 @@ Router knobs worth knowing:
 | `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
 | `router.breaker_threshold` | `3` | consecutive fails before a model opens its breaker |
 | `router.breaker_cooldown_s` | `30` | first cooldown; doubles to `breaker_cooldown_max_s` (300) |
+| `router.provider_pause_default_s` | `5` | provider-wide pause when a 429 has no `Retry-After` |
+| `router.provider_pause_max_s` | `60` | cap on any 429 pause window, however large the header |
 | `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` = whole pool |
 | `discovery.max_probes_per_pass` | `25` | hard ceiling per discovery pass |
 
@@ -368,7 +401,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (269 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (271 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
@@ -378,11 +411,20 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
 
 ## Troubleshooting
 
-**`/health` returns 503.** It is *deep* by design: it fails unless the upstream
-catalog is reachable AND every configured alias has ≥1 healthy candidate. Check
-`GET /mesh/status` — if `ranking_all` is empty for an alias, nothing has evidence
-yet; run `POST /mesh/probe`. A brand-new install has an empty index and is
-legitimately unhealthy until the first discovery pass lands.
+**`/health` returns 503.** 503 means *measured inability to serve*: attempts
+inside the last 30 min, none succeeded, and no eligible candidate. That is
+provider-wide failure or a dead key — check `models_tried` on a real request
+and `GET /mesh/status` for breaker states. A brand-new install with an empty
+index reports `degraded` ("idle, servability unknown") until evidence
+arrives; run `POST /mesh/probe` to seed it.
+
+**`/health` says `degraded`.** Two benign shapes, named in the body:
+`sweep backstop serving` = the floors admit nobody right now but something
+in the pool produced an OK inside 30 min — whole-pool overload is the steady
+state on free endpoints and the sweep arm still serves through it;
+`idle, servability unknown` = the alias simply had no traffic in the window
+(low-cadence ops like evolve fire hours apart) — absence of traffic is not
+failure. Neither needs action.
 
 **Every request 401s.** The daemon does not inherit your shell environment.
 Put the key in `$MESH_HOME/.env` (`NVIDIA_API_KEY=...`, mode 0600) rather than
@@ -391,7 +433,7 @@ at call time, so no restart is needed after writing the file.
 
 **Ranking looks alphabetical.** That is the tell that nothing is actually
 scored — check `rank_inputs` in `/mesh/status`. Models with `bucket: unknown`
-have no in-window evidence; they sort behind everything measured healthy.
+have no recent evidence; they sort behind everything measured healthy.
 
 **A model you expect is missing from `ranking_all`.** Either an eligibility
 floor excluded it (check `scores` for `success_rate` and `n`) or its breaker is

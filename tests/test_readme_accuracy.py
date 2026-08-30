@@ -51,6 +51,8 @@ NUMERIC_CLAIMS = [
     ("router", "fidelity_fails_for_floor", int),
     ("router", "breaker_threshold", int),
     ("router", "breaker_cooldown_s", float),
+    ("router", "provider_pause_default_s", float),
+    ("router", "provider_pause_max_s", float),
     ("discovery", "probe_top_n", int),
     ("discovery", "max_probes_per_pass", int),
 ]
