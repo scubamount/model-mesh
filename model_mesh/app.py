@@ -176,23 +176,39 @@ async def mesh_status():
         oc = cfg.get("op_class", "retain")
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
         ranked = ROUTER.ranked(pool, oc)
-        # Score EVERY model that has evidence, not just the visible top 10.
-        # A truncated view is how the 2026-08-08 eviction hid: a model with
-        # 36/36 successes fell to rank 13 and simply vanished off the end of
-        # this response, so neither /mesh/status nor any check reading it could
-        # see that the proven model had lost its cascade slot. Reporting is
-        # cheap; a blind spot exactly the width of the bug is not.
+        # Score EVERY model in the POOL that has evidence — not just the ones
+        # that survived ranking. A truncated view is how the 2026-08-08
+        # eviction hid: a model with 36/36 successes fell to rank 13 and simply
+        # vanished off the end of this response, so neither /mesh/status nor any
+        # check reading it could see that the proven model had lost its cascade
+        # slot. Reporting is cheap; a blind spot exactly the width of the bug
+        # is not.
+        #
+        # Iterating `ranked` re-opened that blind spot from the other side
+        # (2026-08-30). When the eligibility floors correctly exclude a whole
+        # pool during a provider episode, `ranked` is empty, so `scores` came
+        # back empty too — and a consumer cannot tell "we have never measured
+        # these models" from "we measured them 140 times and every one is
+        # failing". check-mesh-pool-breadth read exactly that and reported
+        # "every candidate is unproven, so routing is guesswork", sending an
+        # operator after whitelist rot in the middle of an outage. Evidence
+        # belongs to the model, not to its current rank: the pool is the right
+        # universe, and `ranking`/`ranking_all` still say who is admitted.
         scores = {}
-        for m in ranked:
+        for m in pool:
             s = INDEX.score(m, oc)
             if s is not None:
                 scores[m] = vars(s)
-        # The two ranking inputs, reported for EVERY ranked model. Ordering is
-        # (bucket, tier, latency), so without these a reader can see the order
-        # but not the reason for it — and the previous ranking failed silently
-        # in exactly that way: every score collapsed to ~50.0, the visible
-        # ordering became alphabetical, and nothing in this response said so.
-        # Anything that decides routing has to be inspectable here.
+        # The two ranking inputs, reported for EVERY model with evidence —
+        # same universe as `scores` above, and for the same reason: during a
+        # whole-pool episode `ranked` is empty, and a bucket table that
+        # disappears exactly when routing gets interesting explains nothing.
+        # Ordering is (bucket, tier, latency), so without these a reader can
+        # see the order but not the reason for it — and the previous ranking
+        # failed silently in exactly that way: every score collapsed to ~50.0,
+        # the visible ordering became alphabetical, and nothing in this
+        # response said so. Anything that decides routing has to be
+        # inspectable here.
         rank_inputs = {
             m: {
                 "tier": quality_tier(m, _TIER_OVERRIDES),
@@ -200,7 +216,7 @@ async def mesh_status():
                     availability_bucket(INDEX.score(m, oc), _OVERLOAD_P95_MS)
                 ],
             }
-            for m in ranked
+            for m in pool
         }
         out["aliases"][alias] = {
             "op_class": oc,
