@@ -252,19 +252,32 @@ class Router:
         b = self.index.breaker_get(model_id)
         if b["state"] == "gone":
             return False
-        if b["state"] == "auth":
-            # Retry-after-cooldown, not terminal: see auth_cooldown_s.
+        if b["state"] in ("auth", "down"):
+            # Retry-after-cooldown, not terminal: see auth_cooldown_s. An
+            # unexpired cooldown is the whole answer — the model is serving
+            # its timeout and nothing below can readmit it.
+            #
             # READ-ONLY here: this method is called by ranked() (the
             # /mesh/status path) and /health — a status poll must not mutate
             # the breaker table. The actual flip to `recovering` happens in
             # dial() at attempt time (see _transition_for_attempt).
-            return time.time() >= b["cooldown_until"]
-        if b["state"] == "down":
-            # Same read-only rule. A `down` model whose cooldown has expired is
-            # still ranked/eligible (the cascade will retry it), but the
-            # transition is deferred to the real dial so introspection stays
-            # side-effect-free.
-            return time.time() >= b["cooldown_until"]
+            if time.time() < b["cooldown_until"]:
+                return False
+            # Cooldown expired => the model gets to be CONSIDERED again, which
+            # is not the same as being admitted. This used to `return True`,
+            # and that early return sat ABOVE every floor below, so opening the
+            # breaker on a model made it MORE eligible than one the breaker had
+            # never touched: the success-rate, thin-evidence, reject, fidelity
+            # and latency floors were all skipped for exactly the models with
+            # the worst evidence. Observed 2026-08-30 — minimax-m3 held rank 0
+            # on live auto/retain AND auto/reflect at success_rate 0.7% (n=140)
+            # ahead of two models that were still answering, and survived a
+            # model rotation (the previous leader had the same shape at 1%,
+            # n=138), because `success_rate > 0` also keeps it out of
+            # BUCKET_FAILING and quality-first ranking then sorts the big id
+            # to the top. Falling through re-imposes the floors; a model with
+            # no adverse evidence still scores None, clears them all, and
+            # returns on schedule, so recovery is unchanged.
         # Sustained-failure floor: catches the intermittent model the
         # consecutive-fail breaker structurally cannot (ok/fail alternating
         # never reaches `breaker_threshold` in a row).
