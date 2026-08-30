@@ -191,9 +191,25 @@ async def health():
                 f"no admitted candidate; last ok {now - last_ok:.0f}s ago "
                 "(sweep backstop serving)"
             )
+            continue
+        # No recent OK — but is that failure or idleness? A low-traffic
+        # alias (evolve fires hours apart) has no ok in ANY 30-min window
+        # most of the day; absence of traffic proves nothing. 503 requires
+        # evidence of FAILING: attempts in-window, none of which succeeded.
+        last_attempt = max(
+            (INDEX.last_sample_ts(m, oc) for m in pool), default=0.0
+        )
+        if now - last_attempt > HEALTH_SERVE_WINDOW_S:
+            degraded[alias] = (
+                "no admitted candidate and no traffic in "
+                f"{HEALTH_SERVE_WINDOW_S:.0f}s (idle, servability unknown)"
+            )
         else:
-            problems[alias] = "cannot serve: no eligible candidate and no ok "\
-                f"in {HEALTH_SERVE_WINDOW_S:.0f}s"
+            problems[alias] = (
+                "cannot serve: attempts in the last "
+                f"{HEALTH_SERVE_WINDOW_S:.0f}s, none succeeded, "
+                "and no eligible candidate"
+            )
 
     if problems:
         return JSONResponse(

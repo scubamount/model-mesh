@@ -84,6 +84,32 @@ def test_health_deep_503_when_alias_cannot_serve(client):
     assert any("cannot serve" in p for p in r.json()["problems"].values())
 
 
+def test_health_idle_alias_is_degraded_not_503(client):
+    """No traffic at all in the serve window ≠ cannot serve. A low-traffic
+    alias (evolve fires hours apart) has no in-window samples most of the
+    day; absence of traffic is not evidence of failure. Must be degraded
+    (200), never 503 — observed 2026-08-30: auto/evolve 503'd /health at
+    16:30 off samples whose newest was 00:00 (idle 16h, not failing 16h)."""
+    import time as _t
+
+    c, idx = client
+    # Old evidence only: failing samples well outside the serve window.
+    with idx._lock:
+        for i in range(4):
+            idx._conn.execute(
+                "INSERT INTO samples (model_id, ts, op_class, source,"
+                " latency_ms, status, payload_chars) VALUES (?,?,?,?,?,?,?)",
+                ("m1", _t.time() - 20000 + i, "retain", "request",
+                 1000.0, "http-500", 10),
+            )
+        idx._conn.commit()
+    r = c.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert any("idle" in v for v in body["degraded"].values())
+
+
 def test_health_degraded_when_sweep_backstop_serving(client):
     """Floors admit nobody, but the pool produced a recent ok (sweep arm):
     the mesh IS serving, so /health must be 200/degraded, not 503. Whole-pool
