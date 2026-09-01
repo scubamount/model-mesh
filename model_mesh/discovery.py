@@ -37,7 +37,7 @@ DORMANT_AFTER_S = 7 * 86400.0
 # Refresh evidence BEFORE it expires, not exactly when it does.
 #
 # `stale_after_s` used to equal SCORE_WINDOW_S (24h) while the discovery pass
-# itself runs once every 24h (StartCalendarInterval 06:15 local). Two equal
+# itself ran once every 24h (StartCalendarInterval 06:15 local). Two equal
 # periods with independent phase is a guaranteed miss, and it fired: on
 # 2026-08-20 the auto/evolve lane's newest probe was 23.96h old — 131 SECONDS
 # short of the cutoff — so every candidate read as "evidence still inside the
@@ -54,6 +54,17 @@ DORMANT_AFTER_S = 7 * 86400.0
 # breadth. Ratio, not a constant, so it tracks any change to SCORE_WINDOW_S —
 # the invariant that matters is margin < window, and the assert below enforces
 # the direction rather than trusting the arithmetic.
+#
+# 2026-09-01: the margin alone was NOT enough, because it only fixed one half.
+# A 19.2h threshold polled once per 24h still cannot be honoured, and macOS
+# additionally skips a StartCalendarInterval job whose minute passes while the
+# machine is asleep (with no catch-up run). Measured over the following 14 days:
+# auto/evolve opened 6 gaps >24h, largest 41.45h, carrying 0 scored models
+# throughout. The schedule is now StartInterval 6h + RunAtLoad
+# (scripts/install-launchd.sh), giving ~3 passes per threshold instead of 1,
+# and the hermes-agent-patches gate `mesh-discovery-schedule` fails if a
+# wall-clock or too-slow schedule ever comes back. Margin and poll rate are one
+# mechanism: changing either without the other re-opens the gap.
 REFRESH_MARGIN = 0.8
 
 # Direction, not arithmetic: a margin of 1.0 or more silently restores the

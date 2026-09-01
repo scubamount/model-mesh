@@ -16,7 +16,12 @@
 #   MESH_HOST/MESH_PORT listen address, written to config.yaml (127.0.0.1:8002)
 #   MESH_PYTHON         interpreter used to create the venv
 #                       (default: first python3.12+ on PATH)
-#   MESH_DISCOVER_HOUR / MESH_DISCOVER_MIN   daily discovery time (6 / 15)
+#   MESH_DISCOVER_INTERVAL_S                 seconds between discovery passes
+#                                            (21600 = 6h). Must stay well under
+#                                            SCORE_WINDOW_S * REFRESH_MARGIN
+#                                            (19.2h) or traffic-free lanes lose
+#                                            their evidence — see the plist
+#                                            comment below.
 set -eu
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,8 +52,7 @@ MESH_LABEL_PREFIX="${MESH_LABEL_PREFIX:-${ADOPTED_PREFIX:-local}}"
 MESH_HOME="${MESH_HOME:-${ADOPTED_HOME:-$HOME/.model-mesh}}"
 MESH_HOST="${MESH_HOST:-127.0.0.1}"
 MESH_PORT="${MESH_PORT:-8002}"
-MESH_DISCOVER_HOUR="${MESH_DISCOVER_HOUR:-6}"
-MESH_DISCOVER_MIN="${MESH_DISCOVER_MIN:-15}"
+MESH_DISCOVER_INTERVAL_S="${MESH_DISCOVER_INTERVAL_S:-21600}"
 
 LABEL_DAEMON="$MESH_LABEL_PREFIX.model-mesh"
 LABEL_DISCOVER="$MESH_LABEL_PREFIX.model-mesh-discover"
@@ -118,7 +122,33 @@ cat > "$PLIST_DIR/$LABEL_DAEMON.plist" <<EOF
 </dict></plist>
 EOF
 
-# --- daily discovery plist ----------------------------------------------------
+# --- discovery plist ----------------------------------------------------------
+# StartInterval (elapsed-time), NOT StartCalendarInterval (wall-clock). Two
+# independent reasons a "once daily at HH:MM" schedule cannot keep a lane scored:
+#
+#   1. PHASE. Index.score() ignores samples older than SCORE_WINDOW_S (24h) and
+#      discovery refreshes at REFRESH_MARGIN * that window (19.2h). A pass that
+#      runs once per 24h cannot honour a 19.2h threshold. Measured 2026-09-01:
+#      auto/evolve opened 6 gaps >24h in 14 days (largest 41.45h) during which
+#      it carried 0 scored models, so the router ordered its entire pool on
+#      priors. Polling faster than the threshold is what makes it real.
+#
+#   2. SLEEP. launchd does not run a StartCalendarInterval job whose minute
+#      passed while the machine was asleep, and does not run it late afterwards.
+#      A laptop asleep at 06:15 loses that whole day's refresh silently.
+#      StartInterval is elapsed-time and launchd runs a missed interval on wake.
+#
+# Why this matters for one lane in particular: auto/retain and
+# auto/consolidation are refreshed for free by live hindsight traffic.
+# auto/evolve has its OWN op_class deliberately (config.py — evolution traffic
+# must not vote in hindsight's ranking), so it has no organic traffic and this
+# pass is its only evidence source. The isolation that protects retain's
+# ranking is exactly what starves evolve of evidence.
+#
+# Cost stays bounded: probe_top_n caps breadth per pass and dormant_after_s
+# skips models with no successes in the window, so a pass is a handful of
+# requests, not a catalog sweep — probing consumes shared free quota, so this
+# must never become "probe every model".
 cat > "$PLIST_DIR/$LABEL_DISCOVER.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -130,10 +160,8 @@ cat > "$PLIST_DIR/$LABEL_DISCOVER.plist" <<EOF
     <string>-X</string><string>POST</string>
     <string>http://$EFFECTIVE/mesh/probe</string>
   </array>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>$MESH_DISCOVER_HOUR</integer>
-    <key>Minute</key><integer>$MESH_DISCOVER_MIN</integer>
-  </dict>
+  <key>StartInterval</key><integer>$MESH_DISCOVER_INTERVAL_S</integer>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$MESH_HOME/discover.log</string>
   <key>StandardErrorPath</key><string>$MESH_HOME/discover.log</string>
 </dict></plist>
@@ -152,5 +180,5 @@ launchctl unload "$PLIST_DIR/$LABEL_DISCOVER.plist" 2>/dev/null || true
 launchctl load "$PLIST_DIR/$LABEL_DISCOVER.plist"
 
 echo "model-mesh loaded on $EFFECTIVE (labels: $LABEL_DAEMON, $LABEL_DISCOVER)"
-echo "discovery runs daily at $MESH_DISCOVER_HOUR:$(printf '%02d' "$MESH_DISCOVER_MIN")"
+echo "discovery runs every $((MESH_DISCOVER_INTERVAL_S / 3600))h (elapsed-time, survives sleep)"
 echo "Verify: curl -s http://$EFFECTIVE/health"

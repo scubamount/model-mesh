@@ -19,7 +19,7 @@ the best model that is up but never requiring any particular one.
 
 ```sh
 git clone <your-fork> model-mesh && cd model-mesh
-sh scripts/install-launchd.sh          # macOS: daemon + daily discovery job
+sh scripts/install-launchd.sh          # macOS: daemon + 6-hourly discovery job
 echo 'NVIDIA_API_KEY=<your-api-key>' >> ~/.model-mesh/.env
 chmod 600 ~/.model-mesh/.env
 curl -s http://127.0.0.1:8002/health
@@ -372,7 +372,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
 
 ## Ops
 
-- `scripts/install-launchd.sh` — installs the daemon + daily discovery job as
+- `scripts/install-launchd.sh` — installs the daemon + 6-hourly discovery job as
   launchd user agents (macOS). **Idempotent and adoptive:** if an install
   already exists it reuses that machine's label prefix and state directory, so
   a reinstall updates your install rather than forking a second daemon onto the
@@ -385,7 +385,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   | `MESH_LABEL_PREFIX` | adopted, else `local` | reverse-DNS prefix for both launchd labels |
   | `MESH_HOST` / `MESH_PORT` | `127.0.0.1` / `8002` | seeds `listen` in a new `config.yaml` |
   | `MESH_PYTHON` | first `python3.12+` on `PATH` | interpreter used to build the venv |
-  | `MESH_DISCOVER_HOUR` / `_MIN` | `6` / `15` | daily discovery time |
+  | `MESH_DISCOVER_INTERVAL_S` | `21600` (6h) | seconds between discovery passes; must stay well under `SCORE_WINDOW_S * REFRESH_MARGIN` (19.2h) or a traffic-free lane's evidence expires |
 
   Restart after code changes:
   `launchctl kickstart -k gui/$(id -u)/<prefix>.model-mesh`.
