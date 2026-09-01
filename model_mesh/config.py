@@ -173,7 +173,13 @@ DEFAULTS: dict = {
             "exclude": _NON_TEXT + ["reasoning"],
         },
         "auto/reflect": {
-            "op_class": "retain",
+            # Its OWN op_class. It was declared "retain" — so every reflect
+            # sample voted in hindsight's retain ranking (a prose reply scored
+            # against the retain JSON contract = fidelity-fail), and reflect
+            # itself was gated on a contract its caller never sends. Live
+            # 2026-09-01: auto/reflect tried 16 models, 12 fidelity-fail,
+            # 503 after 280s, while the same models answered prose in 0.3s.
+            "op_class": "reflect",
             "include": [],
             "exclude": _NON_TEXT + ["reasoning"],
         },

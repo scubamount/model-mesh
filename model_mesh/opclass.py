@@ -50,6 +50,30 @@ CONSOLIDATION_MESSAGES = [
     },
 ]
 
+REFLECT_MESSAGES = [
+    {
+        "role": "system",
+        "content": (
+            # Reflect is PROSE, not JSON. Hindsight's reflect agent asks for a
+            # grounded natural-language synthesis over recalled facts (and
+            # tool-calls its way there); it never asks for a facts envelope.
+            # Scoring it against the retain contract rejected every correct
+            # answer as "content is not valid JSON (markdown/prose leak)" —
+            # see check_fidelity.
+            "You answer questions from the supplied memories. Reply in plain "
+            "prose, grounded in what you were given. No JSON required."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "Memories: the operator runs a local memory daemon on port 9177; "
+            "its embedder is pinned to the GPU.\n"
+            "Question: summarize how the operator's memory stack is wired."
+        ),
+    },
+]
+
 EVOLVE_MESSAGES = [
     {
         "role": "system",
@@ -70,7 +94,7 @@ EVOLVE_MESSAGES = [
 ]
 
 PROMPTS = {"retain": RETAIN_MESSAGES, "consolidation": CONSOLIDATION_MESSAGES,
-           "evolve": EVOLVE_MESSAGES}
+           "reflect": REFLECT_MESSAGES, "evolve": EVOLVE_MESSAGES}
 
 # Pad probes to the op-class's real payload size.
 PAD_CHARS = {"retain": 12000, "consolidation": 12000, "reflect": 12000,
@@ -136,10 +160,30 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
 
     An EMPTY envelope is a valid, successful consolidation: "nothing to merge"
     is a real answer. Only a missing/malformed envelope is a fidelity failure.
+
+    REFLECT IS PROSE. Hindsight's reflect agent asks for a grounded
+    natural-language synthesis; it sends no JSON schema and receives none.
+    Judging it by the retain `facts` contract rejected every CORRECT answer as
+    "content is not valid JSON (markdown/prose leak)" — the 2026-09-01 finding:
+    a live `auto/reflect` request tried 16 models, 12 fidelity-fail, and 503'd
+    after 280s, while `gpt-oss-120b` answered the same alias's underlying model
+    directly in 0.3s. The alias was ALSO mis-declared `op_class: "retain"` in
+    config, so its samples polluted the retain ranking with prose verdicts and
+    it never had a lane of its own. Its contract here is what the caller
+    actually needs: non-empty, non-degenerate text.
     """
     content = parse_content(response)
     if not content or not content.strip():
         return False, "empty content (reasoning-only or no output)"
+
+    if op_class == "reflect":
+        # Deliberately minimal. The only reflect failure a probe can see is
+        # "said nothing" — which the empty-content check above already caught,
+        # including the reasoning-model split (content empty, output in
+        # reasoning_content). Anything stricter re-imports a format opinion the
+        # caller does not hold, and that is the bug this branch exists to fix.
+        return True, "ok"
+
     try:
         parsed = json.loads(_strip_fences(content))
     except (json.JSONDecodeError, ValueError):

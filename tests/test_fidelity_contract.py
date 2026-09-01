@@ -16,7 +16,11 @@ import json
 
 import pytest
 
-from model_mesh.opclass import CONSOLIDATION_MESSAGES, check_fidelity
+from model_mesh.opclass import (
+    CONSOLIDATION_MESSAGES,
+    RETAIN_MESSAGES,
+    check_fidelity,
+)
 
 
 def resp(content):
@@ -131,3 +135,57 @@ def test_retain_rejects_consolidation_envelope():
     """The envelope is consolidation-specific; retain still wants facts."""
     ok, why = check_fidelity(resp('{"creates": [], "updates": []}'), "retain")
     assert not ok
+
+
+# -- reflect is PROSE, and must not be judged by a JSON contract -----------
+#
+# Found live 2026-09-01. auto/reflect was declared `op_class: "retain"`, so a
+# correct prose synthesis was scored "content is not valid JSON (markdown/prose
+# leak)". One real request tried 16 models, 12 fidelity-fail, and 503'd after
+# 280s — while the same models answered the same prompt in 0.3s when dialed
+# directly. Every hindsight mental-model refresh routes through this alias.
+
+def test_reflect_accepts_prose():
+    """The load-bearing case. If this goes red, reflect loses its pool again."""
+    ok, why = check_fidelity(
+        resp("The daemon listens on 9177 and pins its embedder to the GPU."),
+        "reflect")
+    assert ok, why
+
+
+def test_reflect_accepts_markdown():
+    ok, why = check_fidelity(
+        resp("## Memory stack\n\n- daemon: `:9177`\n- embedder: GPU\n"),
+        "reflect")
+    assert ok, why
+
+
+def test_reflect_still_rejects_empty_content():
+    """Reasoning-only replies (output in reasoning_content) remain a failure —
+    'said nothing' is the only thing a reflect probe can actually detect."""
+    ok, why = check_fidelity(resp(""), "reflect")
+    assert not ok
+    assert "empty content" in why
+
+
+def test_reflect_alias_has_its_own_op_class():
+    """A prose alias declared `retain` votes in hindsight's retain ranking with
+    verdicts from a contract retain does not use, and inherits a gate its own
+    caller never sends. Both directions are wrong."""
+    from model_mesh.config import DEFAULTS
+    assert DEFAULTS["aliases"]["auto/reflect"]["op_class"] == "reflect"
+
+
+def test_reflect_probe_prompt_exists_and_passes_its_own_checker():
+    """Same rule as consolidation: probe and request are one contract. Without
+    its own entry, `probe_messages` silently fell back to the RETAIN prompt,
+    so reflect models were probed on a JSON task they are never asked to do."""
+    from model_mesh.opclass import PROMPTS, probe_messages
+    assert "reflect" in PROMPTS, "reflect falls back to the retain probe"
+    msgs = probe_messages("reflect")
+    assert msgs[0] != RETAIN_MESSAGES[0]
+    sys_msg = msgs[0]["content"]
+    assert "JSON" not in sys_msg or "No JSON required" in sys_msg
+    # Whatever the probe asks for must be something check_fidelity accepts.
+    ok, why = check_fidelity(resp("A grounded prose answer."), "reflect")
+    assert ok, why
