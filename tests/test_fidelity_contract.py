@@ -189,3 +189,53 @@ def test_reflect_probe_prompt_exists_and_passes_its_own_checker():
     # Whatever the probe asks for must be something check_fidelity accepts.
     ok, why = check_fidelity(resp("A grounded prose answer."), "reflect")
     assert ok, why
+
+
+# -- a tool call is an ANSWER, not silence ---------------------------------
+#
+# Second half of the same 2026-09-01 incident, and the more general bug: an
+# agentic caller that supplies tools gets `content: null` + `tool_calls: [...]`
+# back on every hop but the last. That was scored "empty content
+# (reasoning-only or no output)" — 21 fidelity-fails across 9 models, each one
+# a model correctly calling the recall tool it was handed. Two consecutive
+# verdicts floor a model out of the op_class, so the entire pool was demoted
+# for behaving correctly, and mental-model refreshes could never finish.
+
+def _tool_call_resp(content=None):
+    return {"choices": [{"message": {
+        "content": content,
+        "tool_calls": [{"id": "call_1", "type": "function",
+                        "function": {"name": "recall",
+                                     "arguments": '{"query": "projects"}'}}],
+    }}]}
+
+
+@pytest.mark.parametrize("op_class", ["reflect", "retain", "consolidation",
+                                      "evolve"])
+def test_tool_call_with_null_content_is_success(op_class):
+    """Applies to every op_class: the caller decides whether tools were on the
+    table, and a model that used them did its job."""
+    ok, why = check_fidelity(_tool_call_resp(None), op_class)
+    assert ok, why
+
+
+def test_empty_string_content_with_tool_calls_is_success():
+    """Providers differ on null vs "" for the same event."""
+    ok, why = check_fidelity(_tool_call_resp(""), "reflect")
+    assert ok, why
+
+
+def test_no_content_and_no_tool_calls_is_still_a_failure():
+    """The discriminating case — without it the fix would accept true
+    silence, which is the reasoning-only failure this gate exists to catch."""
+    ok, why = check_fidelity(resp(""), "reflect")
+    assert not ok
+    assert "empty content" in why
+
+
+def test_empty_tool_calls_list_is_not_a_tool_call():
+    """`tool_calls: []` is the provider saying "I called nothing"."""
+    r = {"choices": [{"message": {"content": None, "tool_calls": []}}]}
+    ok, why = check_fidelity(r, "reflect")
+    assert not ok
+    assert "empty content" in why

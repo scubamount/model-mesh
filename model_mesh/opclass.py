@@ -128,6 +128,23 @@ def parse_content(response: dict) -> Optional[str]:
     return msg.get("content")
 
 
+def _tool_calls(response: dict) -> list:
+    """The assistant's tool calls, if any.
+
+    A reply that hands back `content: null` plus a populated `tool_calls` list
+    is a CORRECT response to a request that supplied tools — it is the model
+    doing the thing it was asked to do. Only a reply with neither is degenerate.
+    Hindsight's reflect agent is native tool-calling, so every one of its first
+    hops looks exactly like this.
+    """
+    try:
+        msg = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return []
+    calls = msg.get("tool_calls")
+    return calls if isinstance(calls, list) else []
+
+
 def _strip_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
@@ -174,6 +191,16 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
     """
     content = parse_content(response)
     if not content or not content.strip():
+        # A tool call IS the answer when tools were supplied. Hindsight's
+        # reflect agent is native tool-calling: its first hops return
+        # `content: null` + `tool_calls: [...]`, which this function scored
+        # "empty content (reasoning-only or no output)" — 21 fidelity-fails
+        # across 9 models on 2026-09-01, every one of them a model correctly
+        # calling the recall tool it was handed. Two consecutive such verdicts
+        # floor a model out of the op_class, so the whole pool was demoted for
+        # doing the right thing. Distinguish "said nothing" from "acted".
+        if _tool_calls(response):
+            return True, "ok"
         return False, "empty content (reasoning-only or no output)"
 
     if op_class == "reflect":
