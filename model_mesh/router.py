@@ -82,9 +82,9 @@ class RouterConfig:
     # wins at runtime and a differing default here would be misleading dead
     # code.
     request_timeout_s_by_op_class: dict = field(
-        default_factory=lambda: {"consolidation": 135.0})
+        default_factory=lambda: {"consolidation": 135.0, "reflect": 135.0})
     probe_timeout_s_by_op_class: dict = field(
-        default_factory=lambda: {"consolidation": 100.0})
+        default_factory=lambda: {"consolidation": 100.0, "reflect": 100.0})
     # Auth failures must EXPIRE. They used to be terminal, and breaker state is
     # persisted in SQLite, so a single daemon start with a missing key (launchctl
     # setenv does not survive a restart of the machine) marked every model 'auth'

@@ -116,8 +116,20 @@ DEFAULTS: dict = {
         # Keyed by op_class so a slow op_class cannot be fixed by inflating the
         # budget for a fast one. Anything absent falls back to the values above.
         # 2 * request stays under total_budget_s (2*135 = 270 < 280).
-        "request_timeout_s_by_op_class": {"consolidation": 135.0},
-        "probe_timeout_s_by_op_class": {"consolidation": 100.0},
+        # 2026-09-01, reflect: the same shape, found the same way. Reflect's own
+        # success p95 is 46.0s and max 86.0s, so a 90s ceiling clips the top of
+        # its real distribution: 64 of 134 timeouts landed in the 88-92s band —
+        # AT the ceiling, not past it. Unlike consolidation this did not empty
+        # the pool (the tool-call fix had just restored it), it degraded ANSWER
+        # QUALITY: a refresh whose recall hop is killed at 90s falls back to a
+        # model that answers fast and ungrounded, and two mental models came
+        # back with `based_on` facts = 0 and invented infrastructure. A budget
+        # that truncates the slow-but-correct path selects for the fast-and-
+        # wrong one. Same 135/100 as consolidation; 2*135 = 270 < 280.
+        "request_timeout_s_by_op_class": {"consolidation": 135.0,
+                                          "reflect": 135.0},
+        "probe_timeout_s_by_op_class": {"consolidation": 100.0,
+                                        "reflect": 100.0},
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
         "min_failures_for_thin_floor": 2,
