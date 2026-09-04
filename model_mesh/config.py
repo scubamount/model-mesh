@@ -126,10 +126,24 @@ DEFAULTS: dict = {
         # back with `based_on` facts = 0 and invented infrastructure. A budget
         # that truncates the slow-but-correct path selects for the fast-and-
         # wrong one. Same 135/100 as consolidation; 2*135 = 270 < 280.
+        # 2026-09-03, retain: the third instance of the same shape, and the one
+        # that finally broke the caller. Retain's own success p95 is 42.9s, p99
+        # 73.4s and max 89.3s (574 successes, 7d) — so the 90s request ceiling
+        # sits INSIDE the distribution, not past it: 222 of 744 retain timeouts
+        # landed in the 85-92s band and another 113 at the 40-47s PROBE ceiling.
+        # Every one was scored as a failure against models that do answer.
+        # Effect was total, not partial: `auto/retain` and `auto/reflect` both
+        # returned nothing at all for >120s while a direct NIM call to the same
+        # models succeeded (gemma-4-31b-it 200 in 44.1s, minimax-m3 200 in 2.8s
+        # measured the same minute), so hindsight_retain failed with an empty
+        # error and memory writes stopped silently.
+        # Same 135/100 as the other two; 2*135 = 270 < total_budget_s 280.
         "request_timeout_s_by_op_class": {"consolidation": 135.0,
-                                          "reflect": 135.0},
+                                          "reflect": 135.0,
+                                          "retain": 135.0},
         "probe_timeout_s_by_op_class": {"consolidation": 100.0,
-                                        "reflect": 100.0},
+                                        "reflect": 100.0,
+                                        "retain": 100.0},
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
         "min_failures_for_thin_floor": 2,

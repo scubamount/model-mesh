@@ -21,6 +21,15 @@ def _mk(tmp_path, transport, **cfg_over):
     index = Index(tmp_path / "mesh.db")
     for m in ("m-a", "m-b"):
         index.ensure_model(m)
+    # These tests are about the provider-pause predicate (pause window vs this
+    # attempt's budget), so the budget must be the one the test states. Every
+    # dial below uses op_class "retain", which carries its own 135s override in
+    # the real defaults (added 2026-09-03 alongside consolidation/reflect); left
+    # in place it silently overrides each test's request_timeout_s and the
+    # "window >> budget" arms stop testing the skip branch. Clear the per-
+    # op_class map here, once, so the scalar governs — a caller that actually
+    # wants an override can still pass one.
+    cfg_over.setdefault("request_timeout_s_by_op_class", {})
     cfg = RouterConfig(**cfg_over)
     r = Router(index, "http://up", "k", cfg=cfg, transport=transport)
     return index, r
@@ -33,6 +42,7 @@ def test_429_arms_provider_pause(tmp_path):
         calls.append(body["model"])
         return 429, {"error": "throttled", "_retry_after_s": 30.0}
 
+    # The scalar budget governs (see _mk: retain's own override is cleared).
     _, r = _mk(tmp_path, transport, request_timeout_s=10.0)
     r.dial("m-a", BODY, "retain", "request")
     assert r._provider_pause_until > time.time() + 25.0
