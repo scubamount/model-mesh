@@ -401,7 +401,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (284 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (286 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living

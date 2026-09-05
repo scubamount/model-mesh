@@ -43,6 +43,12 @@ REJECT_CODES = {400, 413, 422}
 # Same set as status strings, derived so the two can never drift apart.
 REJECT_STATUS_NAMES = {f"http-{c}" for c in REJECT_CODES}
 
+# Eligibility ceiling as a fraction of an op_class's request budget. 75/90 is
+# the measured pair the scalar floor came from (2026-08-07): a ceiling AT the
+# budget admits a model that times out on ~5% of calls by construction, and
+# each of those is scored as a failure against a model that actually works.
+_LATENCY_CEILING_FRACTION = 75.0 / 90.0
+
 
 @dataclass
 class RouterConfig:
@@ -123,6 +129,18 @@ class RouterConfig:
     # (2 x 75 = 150 < 280) so the cascade always has a real second try left.
     # Raise it only if total_budget_s rises too —
     # test_config_defaults_match_dataclass pins these defaults together.
+    #
+    # This scalar is the FALLBACK, not the rule. It is a restatement of the
+    # request budget ("what fits twice"), so when an op_class overrides
+    # request_timeout_s the ceiling must move with it or the two disagree.
+    # Measured 2026-09-05: reflect was raised to 135s to stop clipping its real
+    # distribution, this ceiling stayed at the 90s-era 75s, and eligibility then
+    # rejected reflect's four best models (sr 1.00/0.95/0.90/0.70, p95
+    # 76-102s) as too slow for a budget they fit inside. ranked() returned [],
+    # /health read "degraded", and auto/reflect 503'd for 280s while every one
+    # of those models was serving. The timeout raise had silently un-ranked
+    # exactly the slow-but-correct models it was meant to keep. Derive, never
+    # restate: latency_ceiling_ms() is the single source both sides read.
     max_p95_ms_for_eligibility: float = 75_000.0
     # Last-resort sweep. The main loop dials ranked[:max_attempts]. On total
     # miss the re-probe arm PROBES down the whole list, but pays one probe
@@ -172,6 +190,37 @@ class RouterConfig:
     # maintenance and a static list of pins would rot exactly like the
     # candidates.json this system replaced.
     tier_overrides: dict = field(default_factory=dict)
+
+    def latency_ceiling_ms(self, op_class: Optional[str] = None) -> float:
+        """The eligibility latency ceiling for one op_class.
+
+        Derived from that op_class's OWN request budget rather than restated:
+        the ceiling's whole meaning is "an attempt must fit twice inside the
+        cascade", so it is a function of the budget the attempt actually gets.
+        Keeping it as a standalone scalar meant raising a per-op_class timeout
+        left the ceiling behind, and eligibility then rejected the very models
+        the raise existed to keep (reflect, 2026-09-05 — see
+        max_p95_ms_for_eligibility).
+
+        Floors at the scalar default so this can only ever ADMIT models a
+        longer budget really can serve, never tighten an op_class below the
+        measured-safe 75s. Capped at half of total_budget_s so "derived" still
+        guarantees a real second attempt.
+
+        Keeps the measured 75s-of-90s margin rather than setting the ceiling
+        AT the budget: a model whose p95 equals its request timeout times out
+        on ~5% of calls by construction, and those land as failure samples
+        against a model that works. The original pair was 75/90, so the
+        headroom fraction is that ratio, applied to whatever budget the
+        op_class actually has.
+        """
+        budget_s = self.request_timeout_s_by_op_class.get(
+            op_class, self.request_timeout_s)
+        return min(
+            max(self.max_p95_ms_for_eligibility,
+                budget_s * 1000.0 * _LATENCY_CEILING_FRACTION),
+            self.total_budget_s * 1000.0 / 2.0,
+        )
 
 
 @dataclass
@@ -375,9 +424,13 @@ class Router:
             # stayed ranked #2 on retain, so two attempts blew total_budget_s=240
             # and the op wedged until the watchdog reset it.
             # Ranking already knew (score 51.9 vs 66.4); eligibility did not.
+            #
+            # Ceiling comes from latency_ceiling_ms(op_class), not the raw
+            # scalar: an op_class with a longer request budget must admit the
+            # slower models that budget can actually serve (reflect, 2026-09-05).
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
-                    and s.p95_ms > self.cfg.max_p95_ms_for_eligibility):
+                    and s.p95_ms > self.cfg.latency_ceiling_ms(op_class)):
                 return False
         return True  # healthy | recovering
 

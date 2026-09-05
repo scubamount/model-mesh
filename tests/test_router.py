@@ -254,14 +254,22 @@ def test_latency_floor_excludes_a_model_that_eats_the_cascade_budget(index):
     61% success (ABOVE the 0.5 floor) with p95 96.9s and stayed ranked #2 on
     retain, so two attempts blew total_budget_s=240 and the op wedged in
     'processing' until the watchdog reset it. Ranking already knew it was bad
-    (score 51.9 vs 66.4); eligibility did not look at latency at all."""
+    (score 51.9 vs 66.4); eligibility did not look at latency at all.
+
+    Pins the 90s request budget this incident actually happened under. The
+    ceiling is derived from the budget (latency_ceiling_ms), so leaving the
+    budget implicit made this test silently stop testing the floor when retain
+    was later raised to 135s — under that budget a 96.9s model is servable and
+    SHOULD rank. Same-numbers-different-meaning is how a stale fixture turns
+    into a green gate that checks nothing.
+    """
     for i in range(10):                     # 70% success, all of them slow
         index.ensure_model("slow")
         index.record("slow", "retain", "request",
                      OK if i % 10 < 7 else "timeout", 96_900.0)
     index.ensure_model("fast")
     index.record("fast", "retain", "request", OK, 5_000.0)
-    router, t = make_router(index)
+    router, t = make_router(index, request_timeout_s_by_op_class={})
     s = index.score("slow", "retain")
     assert s.success_rate > 0.5             # passes the success floor
     assert router.ranked(["slow", "fast"], "retain") == ["fast"]
@@ -278,13 +286,22 @@ def test_latency_floor_respects_min_samples(index):
 
 def test_latency_floor_is_per_op_class(index):
     """Consolidation legitimately runs longer than retain. A model that is slow
-    on one op_class must stay eligible for the other, like the success floor."""
+    on one op_class must stay eligible for the other, like the success floor.
+
+    Pins per-op_class budgets explicitly: the ceiling derives from them, so the
+    two op_classes must differ in BUDGET for this to test what it claims. With
+    the shipped defaults both are 135s and a 96.9s model is servable on each —
+    the assertion would still pass while proving nothing about per-op_class
+    scoping.
+    """
     for _ in range(6):
         index.ensure_model("m")
         index.record("m", "retain", "request", OK, 96_900.0)     # too slow
         index.ensure_model("m")
         index.record("m", "consolidation", "request", OK, 40_000.0)  # fine
-    router, t = make_router(index)
+    router, t = make_router(
+        index, request_timeout_s_by_op_class={"retain": 90.0,
+                                              "consolidation": 135.0})
     assert router.ranked(["m"], "retain") == []
     assert router.ranked(["m"], "consolidation") == ["m"]
 
@@ -294,6 +311,38 @@ def test_latency_floor_leaves_room_for_a_second_attempt(index):
     otherwise one slow candidate still consumes the whole failover."""
     cfg = RouterConfig()
     assert 2 * (cfg.max_p95_ms_for_eligibility / 1000.0) < cfg.total_budget_s
+
+
+def test_latency_ceiling_tracks_the_op_class_request_budget(index):
+    """The ceiling must be derived from the budget the op_class actually gets,
+    not from the scalar default.
+
+    Measured 2026-09-05 on the live mesh: auto/reflect ranked [] and returned
+    503 for 280s while its four best models were serving. reflect carries
+    request_timeout_s_by_op_class=135s, but eligibility floored every candidate
+    at the scalar 75s ceiling tuned for the OLD 90s timeout — muse-glimmer-30b
+    (sr 1.00, p95 80.5s), gpt-oss-20b (0.95, 80.3s), laguna-xs-2.1 (0.90,
+    76.4s) and nemotron-3-ultra (0.70, 102.4s) were all rejected as too slow
+    for a budget they fit inside. Raising the per-op_class timeout without
+    raising the matching ceiling silently un-ranks exactly the slow-but-correct
+    models the raise was meant to keep.
+    """
+    for _ in range(6):
+        index.ensure_model("slow")
+        # 80.5s: over the 75s scalar ceiling, well under reflect's 135s budget.
+        index.record("slow", "reflect", "request", OK, 80_500.0)
+    router, t = make_router(index)
+    assert router.ranked(["slow"], "reflect") == ["slow"]
+
+
+def test_latency_ceiling_still_bounds_two_attempts_per_op_class(index):
+    """Derived does not mean unbounded: an op_class ceiling must still leave a
+    real second attempt inside total_budget_s, which is the whole reason the
+    floor exists."""
+    cfg = RouterConfig()
+    for op in set(cfg.request_timeout_s_by_op_class) | {None}:
+        ceiling_s = cfg.latency_ceiling_ms(op) / 1000.0
+        assert 2 * ceiling_s <= cfg.total_budget_s, op
 
 
 def test_http_400_not_retried_and_not_breaker_counted(index):
