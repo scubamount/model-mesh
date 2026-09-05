@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 
 from .config import load_config, resolve_api_key
 from .discovery import candidates_for, discover, fetch_catalog
-from .index import Index
+from .index import OK, Index
 from .opclass import probe_messages
 from .quality import (
     BUCKET_FAILING,
@@ -100,7 +100,11 @@ async def chat_completions(request: Request):
         payload, att = await asyncio.to_thread(
             ROUTER.dial, model, body, "generic", "request"
         )
-        if payload is not None:
+        # Same predicate as route()._dial: a fidelity-fail 200 returns a
+        # payload AND a non-OK attempt. Serving it hands the client output
+        # its own parser rejects (observed live: 4x generic fails served
+        # 200). 502 with the attempt evidence instead.
+        if payload is not None and att.status == OK:
             return JSONResponse(payload)
         return JSONResponse(
             {"error": "upstream failure", "attempt": vars(att)}, status_code=502

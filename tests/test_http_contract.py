@@ -20,6 +20,11 @@ OK_BODY = {
     "model": "m1",
 }
 
+PROSE_BODY = {
+    "choices": [{"message": {"content": "Sure! Here is a thought about that."}}],
+    "model": "bad1",
+}
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
@@ -33,6 +38,8 @@ def client(tmp_path, monkeypatch):
     def transport(url, body, headers, timeout):
         if body.get("model") == "m1":
             return 200, OK_BODY
+        if body.get("model") == "bad1":
+            return 200, PROSE_BODY
         return 404, {"error": "not found"}
 
     router = Router(idx, "http://up/v1", "k", RouterConfig(), transport=transport)
@@ -154,3 +161,20 @@ def test_v1_models_lists_aliases_and_upstream(client):
     ids = [m["id"] for m in body["data"]]
     for alias in ("auto/retain", "auto/consolidation", "auto/reflect", "auto/evolve"):
         assert alias in ids
+
+
+def test_raw_path_rejects_fidelity_fail_body(client):
+    """Raw ids must not serve fidelity-fail payloads.
+
+    Observed live 2026-09-05: 4x gpt-oss-20b `generic` fidelity-fails served
+    200 after 11-30s burns. dial() records the fail but still returns the
+    payload; the raw path gated on `payload is not None` only, while
+    route()._dial gates on `att.status == OK`. Same predicate or the raw
+    path accepts prose the cascade refuses.
+    """
+    c, _ = client
+    r = c.post("/v1/chat/completions", json={
+        "model": "bad1", "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 502
+    assert "attempt" in r.json()
