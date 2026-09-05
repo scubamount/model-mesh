@@ -296,6 +296,15 @@ async def mesh_status():
             "timeouts": {
                 "request_timeout_s": ROUTER.request_timeout(oc),
                 "probe_timeout_s": ROUTER.probe_timeout(oc),
+                # The eligibility latency ceiling this op_class actually runs
+                # under, same rule as the two above. It is DERIVED from the
+                # request budget, so a consumer that restates it as a constant
+                # is wrong the moment a budget moves — which is exactly how
+                # check-mesh-latency-floor.py came to fail a healthy mesh on
+                # 2026-09-05, reporting three models as floor violations while
+                # the router considered them eligible and served them fine.
+                # Publish the predicate, don't make readers reimplement it.
+                "latency_ceiling_ms": ROUTER.cfg.latency_ceiling_ms(oc),
             },
         }
     return out
