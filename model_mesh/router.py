@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 import uuid
 import urllib.error
@@ -223,6 +224,33 @@ class RouterConfig:
         )
 
 
+# DNS/resolution errnos that mean "this machine could not resolve the name",
+# never "the provider said no". EAI_NONAME is what a macOS launchd agent with a
+# wedged resolver returns (observed 2026-09-12, 5202 occurrences in 1-2ms each
+# while `dig` and `curl` from a shell on the same host both worked); the others
+# are the same class on other platforms / transient resolver states.
+_LOCAL_RESOLVER_ERRNOS = frozenset(
+    e for e in (
+        getattr(socket, "EAI_NONAME", None),
+        getattr(socket, "EAI_AGAIN", None),
+        getattr(socket, "EAI_FAIL", None),
+        getattr(socket, "EAI_NODATA", None),
+    )
+    if e is not None
+)
+
+
+def _is_local_resolver_failure(exc: BaseException) -> bool:
+    """True when the exception is this host failing to resolve, not the model.
+
+    Checked by TYPE and errno, never by message text: the string is
+    locale/platform dependent, and a substring match on "not known" would also
+    swallow genuine upstream errors that happen to contain it.
+    """
+    reason = getattr(exc, "reason", exc)
+    return isinstance(reason, socket.gaierror) and reason.errno in _LOCAL_RESOLVER_ERRNOS
+
+
 @dataclass
 class Attempt:
     model_id: str
@@ -308,6 +336,24 @@ class Router:
                     pass  # HTTP-date form or garbage: no pause signal
             return e.code, payload
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # A LOCAL resolver failure is not a statement about the model.
+            # Observed 2026-09-12: a launchd-started instance came up with a
+            # broken resolver and logged 5,202 `URLError: nodename nor servname
+            # provided` in 1-2ms each. Every one was recorded as a failure
+            # sample against whichever model was being dialled, which tripped
+            # its breaker and wiped the scores for three of four aliases —
+            # `mesh-pool-breadth` then correctly reported "0 model(s) carry a
+            # score". DNS worked fine from a shell the whole time; a restart of
+            # the daemon cured it, and neighbouring pids in the same log show
+            # 0 errors, so the fault is per-process, not per-model.
+            #
+            # 599 is already the "not the model's fault" transient code
+            # (malformed upstream body). Reuse it: dial() still fails over to
+            # the next candidate, but record_sample() below refuses to write a
+            # verdict about a model we never actually reached.
+            if _is_local_resolver_failure(e):
+                return 599, {"error": f"local DNS failure, model not reached: {type(e).__name__}: {e}",
+                             "_local_fault": True}
             return 598, {"error": f"{type(e).__name__}: {e}"}
 
     # -- breaker ------------------------------------------------------------
@@ -617,6 +663,22 @@ class Router:
             return None, Attempt(
                 model_id, status, ms, f"rejected (not retryable): {detail}"
             )
+        # Local fault: the request never reached the provider, so there is no
+        # verdict to record about this model. Recording one is how a wedged
+        # resolver on THIS host wiped the alias scores on 2026-09-12 — every
+        # candidate accumulated failure samples and tripped its breaker while
+        # the models themselves were fine. Fail over to the next candidate
+        # (the caller still gets an answer if any path works) but write
+        # nothing: no sample, no breaker count.
+        if payload.get("_local_fault"):
+            detail = str(payload.get("error", ""))[:200]
+            logger.error(
+                "local-fault model=%s op_class=%s ms=%.0f detail=%s "
+                "(NOT recorded against the model; this host could not resolve "
+                "the provider — check DNS, then restart the daemon)",
+                model_id, op_class, ms, detail or "(empty)",
+            )
+            return None, Attempt(model_id, status, ms, detail)
         # transient (incl. 598 network / 599 malformed body)
         self.index.record(model_id, op_class, source, status, ms, payload_chars,
                               request_id=request_id)

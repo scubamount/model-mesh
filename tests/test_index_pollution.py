@@ -9,9 +9,13 @@ with state='gone', plus two orphaned sample rows and an empty-string id.
 
 from __future__ import annotations
 
+import socket
+import urllib.error
+
 import pytest
 
 from model_mesh.index import Index
+from model_mesh.router import Router, RouterConfig, _is_local_resolver_failure
 
 
 @pytest.fixture()
@@ -82,3 +86,96 @@ def test_production_route_never_creates_phantom_state(idx):
         n_samples = idx._conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
         n_models = idx._conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
     assert n_samples == 0 and n_models == 0, "phantom state created for invented id"
+
+
+# --- local-fault isolation (2026-09-12) --------------------------------------
+# A launchd-started daemon came up with a wedged resolver and logged 5,202
+# `URLError: nodename nor servname provided` in 1-2ms each. Every one was
+# recorded as a FAILURE SAMPLE against whichever model was being dialled, which
+# tripped breakers and wiped the scores for three of four aliases. DNS worked
+# from a shell throughout and a restart cured it, so the fault was this host's,
+# not the models'. The index must never carry a verdict about a model the
+# request never reached.
+
+def _dns_error() -> urllib.error.URLError:
+    return urllib.error.URLError(
+        socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+    )
+
+
+@pytest.mark.parametrize(
+    "exc, want",
+    [
+        (_dns_error(), True),
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), False),
+        (TimeoutError("The read operation timed out"), False),
+        # Matched by TYPE+errno, never message text: a genuine upstream error
+        # whose body happens to say "not known" must stay the model's problem.
+        (urllib.error.URLError("upstream said: model not known"), False),
+    ],
+)
+def test_local_resolver_predicate(exc, want):
+    assert _is_local_resolver_failure(exc) is want
+
+
+def _router(tmp_path, transport):
+    idx = Index(tmp_path / "localfault.db")
+    idx.sync_catalog("nim", {"real/model"})
+    return idx, Router(idx, "http://up", "k", cfg=RouterConfig(), transport=transport)
+
+
+def _samples(idx) -> int:
+    with idx._lock:
+        return idx._conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+
+
+def _transport_raising(exc):
+    """A transport that fails the way urlopen does, THROUGH the real classifier.
+
+    The injected transport must not simply raise: in production `_transport`
+    IS `_http_post`, which catches urlopen's exception and turns it into a
+    (status, payload) pair. A test that raises past that boundary exercises a
+    path no real request takes. So call the genuine `_http_post` body with a
+    urlopen stub — the classification under test is the one that ships.
+    """
+    def transport(url, body, headers, budget):
+        import urllib.request as _u
+        real_urlopen = _u.urlopen
+        _u.urlopen = lambda *a, **k: (_ for _ in ()).throw(exc)
+        try:
+            return Router._http_post(_stub_self, url, body, headers, budget)
+        finally:
+            _u.urlopen = real_urlopen
+    return transport
+
+
+class _StubSelf:
+    """Minimal self for _http_post: it only reads nothing but needs to exist."""
+
+
+_stub_self = _StubSelf()
+
+
+def test_dns_failure_records_nothing_against_the_model(tmp_path):
+    """The regression: a local DNS fault must leave the model's record clean."""
+    idx, router = _router(tmp_path, _transport_raising(_dns_error()))
+    router.dial("real/model", {"messages": [{"role": "user", "content": "hi"}]},
+                "retain", "request")
+
+    assert _samples(idx) == 0, "local DNS fault recorded as a model failure"
+    assert all(b.get("consec_fails", 0) == 0 for b in idx.breaker_all().values()), \
+        "local DNS fault counted toward a model's breaker"
+
+
+def test_real_network_failure_still_records(tmp_path):
+    """The other arm: a genuine unreachable upstream IS the model's problem.
+
+    Without this, 'ignore local faults' could be implemented as 'ignore all
+    network errors' and the mesh would stop demoting genuinely dead models.
+    """
+    exc = urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+    idx, router = _router(tmp_path, _transport_raising(exc))
+    router.dial("real/model", {"messages": [{"role": "user", "content": "hi"}]},
+                "retain", "request")
+
+    assert _samples(idx) == 1, "genuine network failure must stay recorded"
