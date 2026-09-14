@@ -314,26 +314,56 @@ def test_latency_floor_leaves_room_for_a_second_attempt(index):
 
 
 def test_dead_slow_alternator_is_ineligible(index):
-    """The floor must read the failure-inclusive p95, not the successes-only one.
+    """A model that times out more often than it succeeds must be excluded.
 
-    Live 2026-09-13: gemma-4-31b-it alternated 46s successes with 94s+ timeouts
-    (2,043 http-598 samples on reflect). p95_ms saw only the successes and
-    stayed under the ceiling; every routed timeout then ate the whole
-    per-attempt budget. Eligibility asks "what does dialling this model cost,
-    including its failures" — that is p95_all_ms.
+    Live 2026-09-13: gemma-4-31b-it on reflect measured 0.36 success with 63%
+    http-598 (144 samples that day; 0.46 the day before). That is below
+    min_success_rate, so the SUCCESS floor owns this case — it needs no latency
+    test at all.
+
+    This fixture used to be a literal 50/50 alternator checked against
+    p95_all_ms > ceiling. Both parts were wrong. 50/50 is not what the incident
+    measured, and routing p95_all into the latency ceiling made every model that
+    ever timed out permanently ineligible: a timeout sample records the
+    per-attempt timeout and the ceiling is a fraction of that same timeout, so
+    the comparison was true by construction. Live consequence (2026-09-14):
+    reflect served 1 of 10 models and consolidation 1 of 9, while the breaker
+    reported those same models healthy. The same model recovered to 0.82 success
+    the next day and still could not be dialed.
     """
-    for i in range(10):
+    for i in range(12):
         index.ensure_model("alt")
         index.record("alt", "retain", "request",
-                     OK if i % 2 == 0 else "http-598",
-                     61_000.0 if i % 2 == 0 else 135_000.0)
+                     OK if i % 3 == 0 else "http-598",
+                     61_000.0 if i % 3 == 0 else 135_000.0)
     index.ensure_model("fast")
     index.record("fast", "retain", "request", OK, 5_000.0)
     router, t = make_router(index)
     s = index.score("alt", "retain")
-    assert s.p95_ms < router.cfg.latency_ceiling_ms("retain")      # old view: admits
-    assert s.p95_all_ms > router.cfg.latency_ceiling_ms("retain")  # true cost exceeds ceiling
-    assert router.ranked(["alt", "fast"], "retain") == ["fast"]    # alt EXCLUDED, not just ordered
+    assert s.success_rate < router.cfg.min_success_rate       # the real signal
+    assert router.ranked(["alt", "fast"], "retain") == ["fast"]  # EXCLUDED
+
+
+def test_occasional_overload_is_not_a_verdict(index):
+    """The other half of the 2026-09-13 correction.
+
+    A model that mostly works but catches provider overload now and then must
+    stay dialable: overload is already charged once, as a breaker cooldown
+    (30s -> 300s). Charging it a second time through a 24h scoring window is
+    what collapsed the lanes. gemma's live shape the day after the incident —
+    0.82 success, 40s when it works — is this test.
+    """
+    index.ensure_model("flaky")
+    for i in range(20):
+        ok = i % 7 != 0                       # ~0.86 success
+        index.record("flaky", "retain", "request",
+                     OK if ok else "http-598",
+                     40_000.0 if ok else 135_000.0)
+    router, t = make_router(index)
+    s = index.score("flaky", "retain")
+    assert s.success_rate > router.cfg.min_success_rate
+    assert s.p95_all_ms > router.cfg.latency_ceiling_ms("retain")  # worst case is huge
+    assert router.eligible("flaky", "retain") is True             # ...and irrelevant
 
 
 def test_fast_model_with_cheap_failures_stays_eligible(index):

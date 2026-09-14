@@ -503,18 +503,46 @@ class Router:
             # Ceiling comes from latency_ceiling_ms(op_class), not the raw
             # scalar: an op_class with a longer request budget must admit the
             # slower models that budget can actually serve (reflect, 2026-09-05).
-            # Latency floor. Reads p95_all_ms, NOT p95_ms: the eligibility
-            # question is "what does dialling this model cost INCLUDING its
-            # failures", and an alternator of fast successes and full-budget
-            # timeouts hides from the successes-only view. Measured 2026-09-13:
-            # gemma/reflect scored p95 46-61s under a 112.5s ceiling while
-            # 2,043 timeouts averaged 81s and ate the attempt budget whole.
-            # Ranking keeps ordering on p95_ms ("behaving when up") — the two
-            # views answer different questions and must not be merged.
+            #
+            # Reads p95_ms (successes only), NOT p95_all_ms. This asks one
+            # question — "when this model works, is a single success affordable?"
+            # Feeding it p95_all (2026-09-13) broke it: a timeout sample records
+            # the per-attempt timeout, and the ceiling is a FRACTION of that same
+            # timeout, so any model that ever timed out failed by construction.
+            # With p95 over the newest SCORE_RECENT_N=20, ~2 timeouts (>=5%)
+            # meant permanent exclusion against a measured 8-19% baseline timeout
+            # rate per model — uniform across vendors, i.e. provider load, not
+            # model fault. Lanes collapsed to whichever model held 0 timeouts
+            # in-window: reflect 10 -> 1, consolidation 9 -> 1 (2026-09-14).
+            #
+            # It also charged one event twice: a slow response already costs the
+            # model a breaker cooldown (_on_transient_fail, 30s -> 300s), the
+            # correct minutes-scale handling of "overloaded right now". The two
+            # disagreed openly — gemma read healthy/consec=0 while this floor
+            # rejected it over a timeout 78 minutes old.
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
-                    and s.p95_all_ms > self.cfg.latency_ceiling_ms(op_class)):
+                    and s.p95_ms > self.cfg.latency_ceiling_ms(op_class)):
                 return False
+            # Budget floor, sibling of the one above and a DIFFERENT question:
+            # "counting the overload it actually suffers, can the cascade afford
+            # to dial this model AND still retry?" A model can be fast when it
+            # works yet fail so often that its expected cost plus one more
+            # full-timeout attempt overruns the budget.
+            #
+            # The 2026-09-13 dead-slow alternator is NOT this test's job: it
+            # measured 0.32 success / 67% timeouts and is excluded by
+            # min_success_rate above. A literal 50/50 model sits exactly on that
+            # boundary and is admitted deliberately — at even odds with a retry
+            # available the cascade does better trying it than refusing it, and
+            # the breaker still reacts if the failures cluster.
+            if s is not None and s.n >= self.cfg.min_samples_for_floor:
+                timeout_ms = 1000.0 * self.cfg.request_timeout_s_by_op_class.get(
+                    op_class, self.cfg.request_timeout_s)
+                expected_ms = (s.success_rate * s.p95_ms
+                               + (1.0 - s.success_rate) * timeout_ms)
+                if expected_ms + timeout_ms > self.cfg.total_budget_s * 1000.0:
+                    return False
         return True  # healthy | recovering
 
     def _on_success(self, model_id: str) -> None:
