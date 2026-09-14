@@ -57,6 +57,17 @@ def test_score_endpoint_enabled_returns_verdicts(client, monkeypatch):
     assert r.json()["scored"]["auto/retain"]["m1"] == "pass"
 
 
+def test_score_audit_record_shape():
+    """The scheduled pass is invisible in logs at launchd log levels, so the
+    JSONL audit record is the durable 'did it run' answer. Pin its shape."""
+    import model_mesh.app as A
+    rec = A._score_audit({"auto/retain": {"m1": "pass", "m2": "busy"}}, 12.34)
+    assert rec["duration_s"] == 12.3
+    assert rec["aliases"]["auto/retain"] == {"pass": 1, "busy": 1}
+    rec2 = A._score_audit({}, 0.0, "RuntimeError: boom")
+    assert rec2["error"] == "RuntimeError: boom"
+
+
 def test_timer_and_endpoint_share_one_body():
     """The endpoint and the startup loop must run the SAME body, and that body
     must be the scorer; two copies drift, and the drift is silent."""

@@ -85,22 +85,48 @@ _SCORE_LOCK = threading.Lock()
 _TIER_OVERRIDES = ROUTER.cfg.tier_overrides
 _OVERLOAD_P95_MS = ROUTER.cfg.overload_p95_ms
 
+def _score_audit(result: dict, duration_s: float, error: str = "") -> dict:
+    """Compact JSONL record for one scheduled pass. Verdict counts, not the
+    verdict map — the per-model evidence is already rows in mesh.db; the
+    audit answers 'did the job run, how long, what did it find'."""
+    rec: dict = {"ts": time.time(), "duration_s": round(duration_s, 1)}
+    if error:
+        rec["error"] = error
+    counts = {}
+    for alias, verdicts in (result or {}).items():
+        c: dict = {}
+        for v in verdicts.values():
+            c[v] = c.get(v, 0) + 1
+        counts[alias] = c
+    rec["aliases"] = counts
+    return rec
+
+
 async def _scoring_loop(sc: dict) -> None:
     """Scheduled lane scoring body. OFF unless config opts in (config.py
     scoring comment: at 42-56% http-598 rates, scheduled probes mostly add
     timeout samples and spend 429 quota). A pass failure logs and waits for
-    the next tick — it must never take the serving path down."""
+    the next tick — it must never take the serving path down.
+
+    Every pass appends an audit line (same rule as /mesh/probe: a job whose
+    run is invisible is not a check — INFO records are dropped at the root
+    handler in the launchd deployment, so 'did it run?' otherwise has no
+    durable answer)."""
+    audit = _state_dir() / "audit" / "scoring.jsonl"
     await asyncio.sleep(sc.get("startup_delay_s", 10.0))
     while True:
         try:
             if _SCORE_LOCK.acquire(blocking=False):
+                started = time.time()
                 try:
-                    await asyncio.get_running_loop().run_in_executor(
+                    result = await asyncio.get_running_loop().run_in_executor(
                         None, _score_once)
+                    _audit(audit, _score_audit(result, time.time() - started))
                 finally:
                     _SCORE_LOCK.release()
-        except Exception:
+        except Exception as e:
             logger.exception("scheduled score pass failed; retrying next tick")
+            _audit(audit, _score_audit({}, 0.0, f"{type(e).__name__}: {e}"))
         await asyncio.sleep(sc.get("interval_s", 1800))
 
 
