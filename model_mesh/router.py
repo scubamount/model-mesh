@@ -474,9 +474,17 @@ class Router:
             # Ceiling comes from latency_ceiling_ms(op_class), not the raw
             # scalar: an op_class with a longer request budget must admit the
             # slower models that budget can actually serve (reflect, 2026-09-05).
+            # Latency floor. Reads p95_all_ms, NOT p95_ms: the eligibility
+            # question is "what does dialling this model cost INCLUDING its
+            # failures", and an alternator of fast successes and full-budget
+            # timeouts hides from the successes-only view. Measured 2026-09-13:
+            # gemma/reflect scored p95 46-61s under a 112.5s ceiling while
+            # 2,043 timeouts averaged 81s and ate the attempt budget whole.
+            # Ranking keeps ordering on p95_ms ("behaving when up") — the two
+            # views answer different questions and must not be merged.
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
-                    and s.p95_ms > self.cfg.latency_ceiling_ms(op_class)):
+                    and s.p95_all_ms > self.cfg.latency_ceiling_ms(op_class)):
                 return False
         return True  # healthy | recovering
 

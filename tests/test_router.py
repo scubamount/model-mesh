@@ -313,6 +313,41 @@ def test_latency_floor_leaves_room_for_a_second_attempt(index):
     assert 2 * (cfg.max_p95_ms_for_eligibility / 1000.0) < cfg.total_budget_s
 
 
+def test_dead_slow_alternator_is_ineligible(index):
+    """The floor must read the failure-inclusive p95, not the successes-only one.
+
+    Live 2026-09-13: gemma-4-31b-it alternated 46s successes with 94s+ timeouts
+    (2,043 http-598 samples on reflect). p95_ms saw only the successes and
+    stayed under the ceiling; every routed timeout then ate the whole
+    per-attempt budget. Eligibility asks "what does dialling this model cost,
+    including its failures" — that is p95_all_ms.
+    """
+    for i in range(10):
+        index.ensure_model("alt")
+        index.record("alt", "retain", "request",
+                     OK if i % 2 == 0 else "http-598",
+                     61_000.0 if i % 2 == 0 else 135_000.0)
+    index.ensure_model("fast")
+    index.record("fast", "retain", "request", OK, 5_000.0)
+    router, t = make_router(index)
+    s = index.score("alt", "retain")
+    assert s.p95_ms < router.cfg.latency_ceiling_ms("retain")      # old view: admits
+    assert s.p95_all_ms > router.cfg.latency_ceiling_ms("retain")  # true cost exceeds ceiling
+    assert router.ranked(["alt", "fast"], "retain") == ["fast"]    # alt EXCLUDED, not just ordered
+
+
+def test_fast_model_with_cheap_failures_stays_eligible(index):
+    """The floor charges failures at their REAL cost. A model that fails fast
+    (rejects, quick 5xx) pays nothing extra over its success latency."""
+    for i in range(10):
+        index.ensure_model("quick-fail")
+        index.record("quick-fail", "retain", "request",
+                     OK if i % 10 < 9 else "http-500",
+                     8_000.0 if i % 10 < 9 else 12_000.0)
+    router, t = make_router(index)
+    assert router.ranked(["quick-fail"], "retain") == ["quick-fail"]
+
+
 def test_latency_ceiling_tracks_the_op_class_request_budget(index):
     """The ceiling must be derived from the budget the op_class actually gets,
     not from the scalar default.
