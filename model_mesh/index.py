@@ -133,6 +133,12 @@ class Score:
     spike_rate: float
     success_rate: float
     n: int
+    # Failure-inclusive p95. p95_ms answers "how does this model behave when it
+    # works" (ordering); p95_all_ms answers "what did its worst recent attempt
+    # cost" (eligibility). A model alternating fast successes and full-budget
+    # timeouts hides entirely from p95_ms. Observed 2026-09-13: gemma/reflect
+    # 2,043 http-598 samples averaging 81s, invisible to the latency floor.
+    p95_all_ms: float = 0.0
 
 
 class Index:
@@ -427,7 +433,10 @@ class Index:
 
         Returns the raw measurements — p95, jitter, spike-rate, success-rate,
         sample count — and does NOT reduce them to a single number. Ranking is
-        `quality.rank_key()`, which reads these fields directly.
+        `quality.rank_key()`, which reads these fields directly. Which latency
+        view is which: p95_ms = successes-only ("behaving when up", ranking);
+        p95_all_ms = every attempt ("what dialling it costs", the eligibility
+        floor in router.eligible()). Merging them re-hides the alternator.
 
         There used to be a blended float here (0.30 p95 + 0.30 jitter + 0.20
         spike + 0.20 success, with confidence shrinkage toward a neutral prior).
@@ -452,13 +461,18 @@ class Index:
         if not rows:
             return None
         oks = [r[0] for r in rows if r[1] == OK and r[0] is not None]
+        all_lat = [r[0] for r in rows if r[0] is not None]
+        p95_all = (sorted(all_lat)[max(0, int(len(all_lat) * 0.95) - 1)]
+                   if all_lat else 30_000.0)
         n = len(rows)
         success_rate = len(oks) / n
         if not oks:
-            # All failures in-window. p95 uses the 30s ceiling (not inf — the
+            # All failures in-window. p95_ms uses the 30s ceiling (not inf — the
             # value must survive JSON serialization in /mesh/status).
+            # p95_all_ms keeps the REAL failure latency: that is the whole
+            # point of the field (dead-slow alternator, 2026-09-13).
             # success_rate 0.0 is what puts this model in BUCKET_FAILING.
-            return Score(model_id, 30_000.0, 1.0, 1.0, 0.0, n)
+            return Score(model_id, 30_000.0, 1.0, 1.0, 0.0, n, p95_all)
 
         med = statistics.median(oks)
         p95 = sorted(oks)[max(0, int(len(oks) * 0.95) - 1)]
@@ -467,7 +481,7 @@ class Index:
         spike_rate = spikes / len(oks)
 
         return Score(model_id, p95, round(jitter, 3),
-                     round(spike_rate, 3), round(success_rate, 3), n)
+                     round(spike_rate, 3), round(success_rate, 3), n, p95_all)
 
     # -- breaker ------------------------------------------------------------
 
