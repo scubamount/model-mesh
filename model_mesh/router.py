@@ -70,8 +70,11 @@ class RouterConfig:
     max_attempts: int = 8               # candidates tried before the re-probe arm
     reprobe_top_n: int = 4              # models re-probed on total miss
     # 90s, not 120s: a timeout burns this ENTIRE value (measured median 120.1s
-    # per http-598, 4323s total across 36 timeouts), so the per-attempt timeout
-    # sets the price of one failure. At 120s only two failures fit in a 240s
+    # per http-598, 4323s total across 36 timeouts; era note 2026-09-14 — those
+    # numbers predate per-op_class budgets, which are now 90 default / 135 for
+    # retain-consolidation-reflect via request_timeout_s_by_op_class; the ratio
+    # reasoning stands: a timeout costs its full budget), so the per-attempt
+    # timeout sets the price of one failure. At 120s only two failures fit in a 240s
     # budget and the third attempt was always 'skipped-budget' — max_attempts=3
     # was unreachable in the worst case. Measured success latencies: p95 51.6s,
     # p99 88.4s, max 117.8s, so 90s aborts ~1% of successes, and those cascade

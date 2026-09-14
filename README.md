@@ -171,8 +171,13 @@ guessed:
   the op_class after two occurrences; the model stays eligible for others.
 - **Success floor**: below `min_success_rate` (0.5) over `min_samples_for_floor`
   (4) recent samples, a model does not serve that op_class.
-- **Latency floor**: measured p95 above `max_p95_ms_for_eligibility` (75s)
-  excludes the model — an attempt must be able to run twice inside the budget.
+- **Latency floor**: measured p95 above the op_class's derived ceiling
+  (`latency_ceiling_ms`, ≥ 75s, = request budget × headroom, capped at half
+  `total_budget_s`) excludes the model — an attempt must be able to run twice
+  inside the budget. It reads the **failure-inclusive** p95 (`p95_all_ms`):
+  a model whose successes are fast but whose timeouts eat the attempt budget
+  is exactly what this floor exists to exclude, and the successes-only p95
+  (which ranking keeps, for "behaving when up") hides it.
 
 Floors are caution, not verdicts: when they exclude everything, the sweep arm
 (arm 3 below) still tries them, because a total miss means the caution already
@@ -287,7 +292,14 @@ unpredictably:
   `breaker` state per model. Per-model measurements live on `/mesh/status`.
 - `POST /mesh/probe` — force a discovery pass now; returns the same
   new/eol/probed report as the daily job. Discovers and fidelity-tests models;
-  it does not score them — scores backfill from real traffic.
+  it does not score them — scores backfill from real traffic (or `POST
+  /mesh/score`).
+- `POST /mesh/score` — one **scoring pass**: probes the top `scoring.probe_top_n`
+  candidates of every alias lane through the same probe arm the cascade uses,
+  so eligibility and `/mesh/status` reflect the evidence immediately. 409 when
+  `scoring.enabled` is false (it ships disabled: at 42–56% http-598 rates
+  scheduled probes mostly add timeout samples and spend shared-key 429 quota),
+  429 when a pass is already running.
 - `GET /mesh/discovery` — recent discovery runs: timestamp, duration, and the
   `new`/`eol`/`returned`/`probed` sets per pass. The churn record the whole
   probe design exists for.
@@ -336,7 +348,7 @@ Router knobs worth knowing:
 | `router.probe_timeout_s` | `45` | probe attempt ceiling |
 | `router.probe_timeout_s_by_op_class` | `{consolidation: 100}` | per-op_class probe override |
 | `router.overload_p95_ms` | `20000` | p95 at/above this = overloaded → demoted |
-| `router.max_p95_ms_for_eligibility` | `75000` | measured p95 above this excludes the model |
+| `router.max_p95_ms_for_eligibility` | `75000` | latency-floor FLOOR (per-op_class ceiling derives upward from the request budget); measured p95_all_ms above it excludes the model |
 | `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the size heuristic misjudges |
 | `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
 | `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
@@ -346,6 +358,9 @@ Router knobs worth knowing:
 | `router.provider_pause_max_s` | `60` | cap on any 429 pause window, however large the header |
 | `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` = whole pool |
 | `discovery.max_probes_per_pass` | `25` | hard ceiling per discovery pass |
+| `scoring.enabled` | `false` | scheduled lane scoring OFF by default (see config.py comment: http-598 mix); opt in via this file |
+| `scoring.interval_s` | `1800` | seconds between scheduled scoring passes when enabled |
+| `scoring.probe_top_n` | `6` | candidates probed per alias per scheduled pass |
 
 Keep `2 × request_timeout_s < total_budget_s` so one slow model cannot consume
 the whole cascade.
