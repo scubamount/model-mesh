@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -33,6 +35,7 @@ from .quality import (
 )
 from .quality import tier as quality_tier
 from .router import Router, RouterConfig
+from .scorer import run_score_pass
 
 _BUCKET_NAMES = {
     BUCKET_HEALTHY: "healthy",
@@ -40,6 +43,8 @@ _BUCKET_NAMES = {
     BUCKET_UNKNOWN: "unknown",
     BUCKET_FAILING: "failing",
 }
+
+logger = logging.getLogger("model_mesh.app")
 
 # /health "degraded" window: an OK anywhere in the pool this recent proves the
 # mesh can serve even when the floors admit nobody (sweep backstop). Sized to
@@ -72,6 +77,7 @@ ROUTER = Router(
     RouterConfig(**CFG.get("router", {})),
 )
 _DISCOVERY_LOCK = threading.Lock()
+_SCORE_LOCK = threading.Lock()
 # Read off the ROUTER's own config rather than re-reading CFG: /mesh/status must
 # report the values that actually rank requests. Two independent reads of the
 # same config is how a status page starts describing a system that no longer
@@ -79,7 +85,42 @@ _DISCOVERY_LOCK = threading.Lock()
 _TIER_OVERRIDES = ROUTER.cfg.tier_overrides
 _OVERLOAD_P95_MS = ROUTER.cfg.overload_p95_ms
 
-app = FastAPI(title="model-mesh")
+async def _scoring_loop(sc: dict) -> None:
+    """Scheduled lane scoring body. OFF unless config opts in (config.py
+    scoring comment: at 42-56% http-598 rates, scheduled probes mostly add
+    timeout samples and spend 429 quota). A pass failure logs and waits for
+    the next tick — it must never take the serving path down."""
+    await asyncio.sleep(sc.get("startup_delay_s", 10.0))
+    while True:
+        try:
+            if _SCORE_LOCK.acquire(blocking=False):
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, _score_once)
+                finally:
+                    _SCORE_LOCK.release()
+        except Exception:
+            logger.exception("scheduled score pass failed; retrying next tick")
+        await asyncio.sleep(sc.get("interval_s", 1800))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Startup/shutdown for the ONE background job the app owns (replaces the
+    deprecated on_event pair). The task is ALWAYS cancelled on shutdown, so a
+    reload or test client never leaks it. Names resolve at call time, so
+    _score_once being defined later in this module is fine."""
+    sc = CFG.get("scoring") or {}
+    task = asyncio.create_task(_scoring_loop(sc)) if sc.get("enabled", False) else None
+    app.state.scoring_task = task
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+
+
+app = FastAPI(title="model-mesh", lifespan=_lifespan)
 
 
 def _alias_cfg(model: str) -> dict | None:
@@ -359,6 +400,45 @@ async def mesh_probe():
         raise
     finally:
         _DISCOVERY_LOCK.release()
+
+
+def _score_once() -> dict:
+    """One scoring pass, sync body — the SINGLE implementation behind both the
+    /mesh/score endpoint and the startup timer. Two copies of this drift, and
+    the drift is silent (test_score_endpoint pins the sharing)."""
+    sc = CFG.get("scoring") or {}
+    top_n = sc.get("probe_top_n", 6)
+    return run_score_pass(
+        CFG, ROUTER,
+        lambda index, provider, alias_cfg, alias: candidates_for(
+            INDEX, provider, alias_cfg),
+        top_n=top_n,
+    )
+
+
+@app.post("/mesh/score")
+async def mesh_score():
+    """One scoring pass: probes the top candidates of every alias lane.
+
+    Recorded through dial() exactly like an in-cascade probe, so eligibility
+    and /mesh/status reflect it immediately. Manual trigger for the same work
+    the background timer does. Locked like /mesh/probe: two concurrent passes
+    double the load on a 429-sensitive shared key for no extra evidence.
+    """
+    sc = CFG.get("scoring") or {}
+    if not sc.get("enabled", False):
+        return JSONResponse(status_code=409,
+                            content={"error": "scoring disabled (config: scoring.enabled)"})
+    if not _SCORE_LOCK.acquire(blocking=False):
+        return JSONResponse({"status": "already running"}, status_code=429)
+    try:
+        loop = asyncio.get_running_loop()
+        scored = await loop.run_in_executor(None, _score_once)
+        return {"scored": scored, "at": time.time()}
+    finally:
+        _SCORE_LOCK.release()
+
+
 
 
 def _audit(path: Path, record: dict) -> None:
