@@ -16,6 +16,7 @@ predecessor silently lost redundancy):
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import socket
@@ -239,16 +240,41 @@ _LOCAL_RESOLVER_ERRNOS = frozenset(
     if e is not None
 )
 
+# Route-family errnos: the packet never left this host. Same incident class as
+# the resolver fault above (sleep, interface flap, VPN topology, the laptop
+# slept): they hit EVERY candidate identically, so scoring them against a model
+# manufactures the phantom-breaker damage of 2026-09-12 at a different layer.
+# ECONNUNREACH is Linux-only (BSD/EUIA family lives under EHOSTUNREACH here);
+# getattr keeps this importable on macOS. Deliberately NOT here: ECONNREFUSED
+# and connection resets — the peer answered and rejected/reset, which IS
+# evidence about the provider; read timeouts likewise stay the model's.
+_LOCAL_ROUTE_ERRNOS = frozenset(
+    e for e in (
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ECONNUNREACH", None),
+    )
+    if e is not None
+)
+
 
 def _is_local_resolver_failure(exc: BaseException) -> bool:
-    """True when the exception is this host failing to resolve, not the model.
-
-    Checked by TYPE and errno, never by message text: the string is
-    locale/platform dependent, and a substring match on "not known" would also
-    swallow genuine upstream errors that happen to contain it.
-    """
+    """True when the exception is this host failing to resolve, not the model."""
     reason = getattr(exc, "reason", exc)
     return isinstance(reason, socket.gaierror) and reason.errno in _LOCAL_RESOLVER_ERRNOS
+
+
+def _is_local_network_failure(exc: BaseException) -> bool:
+    """True when THIS host could not reach the provider at all — resolution or
+    routing. Checked by TYPE and errno, never message text (same rule as the
+    resolver predicate: strings are locale/platform dependent)."""
+    if _is_local_resolver_failure(exc):
+        return True
+    reason = getattr(exc, "reason", exc)
+    return (isinstance(reason, OSError)
+            and not isinstance(reason, socket.gaierror)
+            and getattr(reason, "errno", None) in _LOCAL_ROUTE_ERRNOS)
 
 
 @dataclass
@@ -351,8 +377,8 @@ class Router:
             # (malformed upstream body). Reuse it: dial() still fails over to
             # the next candidate, but record_sample() below refuses to write a
             # verdict about a model we never actually reached.
-            if _is_local_resolver_failure(e):
-                return 599, {"error": f"local DNS failure, model not reached: {type(e).__name__}: {e}",
+            if _is_local_network_failure(e):
+                return 599, {"error": f"local network fault, model not reached: {type(e).__name__}: {e}",
                              "_local_fault": True}
             return 598, {"error": f"{type(e).__name__}: {e}"}
 
@@ -489,10 +515,17 @@ class Router:
         return True  # healthy | recovering
 
     def _on_success(self, model_id: str) -> None:
+        prev = self.index.breaker_get(model_id)["state"]
         self.index.breaker_set(
             model_id, state="healthy", consec_fails=0,
             cooldown_until=0.0, cooldown_s=0.0,
         )
+        if prev != "healthy":
+            # Transitions log (2026-09-14): SQLite-only writes made "did the
+            # breaker open / close?" unanswerable from logs (0 hits in 24,665
+            # lines) — the 2026-08-03 postmortem rule is breakers must open
+            # AND close, and an operator must be able to WATCH that happen.
+            logger.warning("breaker-transition model=%s %s->healthy", model_id, prev)
 
     def _on_transient_fail(self, model_id: str) -> None:
         b = self.index.breaker_get(model_id)
@@ -505,12 +538,20 @@ class Router:
                 model_id, state="down", consec_fails=consec,
                 cooldown_s=cd, cooldown_until=time.time() + cd,
             )
+            logger.warning(
+                "breaker-transition model=%s recovering->down consec=%d "
+                "cooldown_s=%.0f (failed recovery probe; doubled cooldown)",
+                model_id, consec, cd)
         elif consec >= self.cfg.breaker_threshold:
             cd = self.cfg.breaker_cooldown_s
             self.index.breaker_set(
                 model_id, state="down", consec_fails=consec,
                 cooldown_s=cd, cooldown_until=time.time() + cd,
             )
+            logger.warning(
+                "breaker-transition model=%s %s->down consec=%d cooldown_s=%.0f "
+                "(threshold=%d)", model_id, b["state"], consec, cd,
+                self.cfg.breaker_threshold)
         else:
             self.index.breaker_set(model_id, consec_fails=consec)
 
@@ -682,8 +723,9 @@ class Router:
             detail = str(payload.get("error", ""))[:200]
             logger.error(
                 "local-fault model=%s op_class=%s ms=%.0f detail=%s "
-                "(NOT recorded against the model; this host could not resolve "
-                "the provider — check DNS, then restart the daemon)",
+                "(NOT recorded against the model; this host could not reach "
+                "the provider — check this host's DNS/routes, then restart the "
+                "daemon)",
                 model_id, op_class, ms, detail or "(empty)",
             )
             return None, Attempt(model_id, status, ms, detail)

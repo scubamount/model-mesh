@@ -179,3 +179,71 @@ def test_real_network_failure_still_records(tmp_path):
                 "retain", "request")
 
     assert _samples(idx) == 1, "genuine network failure must stay recorded"
+
+
+# --- local route-fault isolation (2026-09-14) ----------------------------------
+# Same incident class as the DNS fault above: ENETUNREACH/EHOSTUNREACH/ENETDOWN/
+# ECONNUNREACH mean the packet never left this host (sleep, interface flap, VPN
+# topology). They hit EVERY candidate identically, so recording them against a
+# model manufactures the exact phantom-breaker damage the 2026-09-12 incident
+# caused. Extends _is_local_resolver_failure to a network-failure predicate.
+
+import errno as _errno
+
+
+def _route_error(en=_errno.ENETUNREACH) -> urllib.error.URLError:
+    return urllib.error.URLError(OSError(en, "Network is unreachable"))
+
+
+@pytest.mark.parametrize(
+    "exc, want",
+    [
+        (_route_error(_errno.ENETUNREACH), True),
+        (_route_error(_errno.EHOSTUNREACH), True),
+        (_route_error(_errno.ENETDOWN), True),
+        *([(_route_error(_errno.ECONNUNREACH), True)]
+           if getattr(_errno, "ECONNUNREACH", None) is not None
+           else []),  # Linux-only errno; getattr like router._LOCAL_ROUTE_ERRNOS
+        (_dns_error(), True),
+        # Provider-side and genuine-connection failures stay the model's problem:
+        (urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), False),
+        (urllib.error.URLError(ConnectionResetError(54, "Connection reset by peer")), False),
+        (TimeoutError("The read operation timed out"), False),
+    ],
+)
+def test_local_network_predicate(exc, want):
+    from model_mesh.router import _is_local_network_failure
+    assert _is_local_network_failure(exc) is want
+
+
+def test_enetunreach_records_nothing_against_the_model(tmp_path):
+    """Route errnos follow the DNS precedent: no sample, no breaker count."""
+    idx, router = _router(tmp_path, _transport_raising(_route_error()))
+    router.dial("real/model", {"messages": [{"role": "user", "content": "hi"}]},
+                "retain", "request")
+    assert _samples(idx) == 0, "local route fault recorded as a model failure"
+    assert all(b.get("consec_fails", 0) == 0 for b in idx.breaker_all().values()), \
+        "local route fault counted toward a model's breaker"
+
+
+# --- breaker transitions are observable in the log (2026-09-14) ----------------
+# Forensics found ZERO 'breaker'/'opened'/'cooldown' lines in 24,665 lines of
+# mesh.log: transitions wrote SQLite only, so "did the breaker trip?" was
+# unanswerable from logs by construction. One WARNING per transition.
+
+def test_breaker_transition_logs_a_warning(tmp_path, caplog):
+    import logging
+    idx = Index(tmp_path / "breakerlog.db")
+    idx.sync_catalog("nim", {"m"})
+    def t(url, body, headers, budget):
+        return 503, {"error": "boom"}
+    idx, router = _router(tmp_path, t)
+    with caplog.at_level(logging.WARNING, logger="model_mesh.router"):
+        for _ in range(3):
+            router.dial("m", {"messages": [{"role": "user", "content": "hi"}]},
+                        "retain", "request")
+    assert any("breaker" in r.message.lower() or "breaker-transition" in r.getMessage().lower()
+               for r in caplog.records), "breaker transition logged nothing"
+    b = idx.breaker_get("m")
+    assert b["state"] == "down", "3 consecutive transients must open the breaker"
+
