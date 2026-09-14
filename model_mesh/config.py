@@ -182,6 +182,24 @@ DEFAULTS: dict = {
     # shared free endpoint. 6 keeps freshly-measured alternatives ahead of the
     # ranking while conserving quota.
     "discovery": {"max_probes_per_pass": 25, "probe_top_n": 6},
+    # Scheduled lane scoring: evidence for eligibility comes from live traffic
+    # or probes and EXPIRES (index.py SCORE_WINDOW_S / SCORE_RECENT_N), so a
+    # thin lane can starve to 1-of-11 eligible while models are actually
+    # serving (2026-09, the auto/evolve recurrence: only real traffic scores,
+    # backfill was a manual script). This drives the EXISTING probe arm on a
+    # timer — dial() records probe samples exactly like an in-cascade probe,
+    # no new recording path.
+    # OFF by default (forensics 2026-09-14): measured http-598 rates of
+    # 42-56% per lane mean scheduled probes would mostly ADD timeout samples
+    # against overloaded models and spend the shared 429-sensitive key (1,201
+    # logged 429s). Opt in via ~/.model-mesh/config.yaml once the timeout mix
+    # is understood as provider load rather than model fault.
+    "scoring": {
+        "enabled": False,
+        "interval_s": 1800,     # half-hourly; a pass takes seconds ≪ interval
+        "startup_delay_s": 10.0,  # first pass on a cold daemon, not after 30m
+        "probe_top_n": 6,       # candidates probed per alias per pass
+    },
     # Non-text modalities and non-generative heads. EXCLUSION-first on purpose:
     # an include-whitelist of families matched 5 of 102 live NIM models and
     # silently shrank as NIM's catalog grew (see discovery.eligible_for_alias).
