@@ -53,6 +53,9 @@ NUMERIC_CLAIMS = [
     ("router", "breaker_cooldown_s", float),
     ("router", "provider_pause_default_s", float),
     ("router", "provider_pause_max_s", float),
+    ("router", "quota_backoff_base_s", float),
+    ("router", "quota_backoff_max_s", float),
+    ("router", "quota_cooldown_floor_s", float),
     ("discovery", "probe_top_n", int),
     ("discovery", "max_probes_per_pass", int),
 ]

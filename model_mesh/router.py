@@ -7,9 +7,10 @@ evidence only after everything (including a fresh probe pass) failed.
 Failure taxonomy (each class routes differently — collapsing them is how the
 predecessor silently lost redundancy):
 
-  transient  429 / 5xx / timeout / malformed-JSON  -> breaker counts, cascade
-             (429 additionally arms a provider-wide pause: the throttle is
-              on the shared key, not the model — see dial())
+  quota      429                                   -> per-model quota ladder
+             (its OWN timer, never breaker-counted) + provider-wide pause:
+             the throttle is on the shared key — see dial()
+  transient  5xx / timeout / malformed-JSON        -> breaker counts, cascade
   auth       401 / 403                             -> mark 'auth', skip provider, NO breaker poison
   gone       404 / 410                             -> index.mark_gone NOW, cascade
 """
@@ -20,6 +21,7 @@ import errno
 import json
 import logging
 import socket
+import threading
 import time
 import uuid
 import urllib.error
@@ -62,6 +64,19 @@ class RouterConfig:
     # hostile/buggy header so one response can't bench the whole mesh.
     provider_pause_default_s: float = 5.0
     provider_pause_max_s: float = 60.0
+    # Per-model quota cooldown ladder, a SEPARATE timer from the failure
+    # breaker. Adopted from CLIProxyAPI (sdk/cliproxy/auth/conductor_refresh.go
+    # quotaBackoffBase=1s / quotaBackoffMax=30m / minQuotaCooldownFloor=10s;
+    # ladder in conductor_cooldown.go nextQuotaCooldown): a 429 without
+    # Retry-After benches the model for base * 2**level, level climbs per
+    # 429 that lands after the previous window expired, capped at max; a 429
+    # WITH Retry-After benches for max(Retry-After, floor) and leaves the
+    # level alone. One success resets the level. A 429 is "slow down", not
+    # "broken", so it must not count toward breaker_threshold: mixing the two
+    # opened the failure breaker on a model that was only throttled.
+    quota_backoff_base_s: float = 1.0
+    quota_backoff_max_s: float = 1800.0
+    quota_cooldown_floor_s: float = 10.0
     # Attempt COUNT must not be the binding constraint — the budget should be.
     # Measured 2026-08-10: a deterministic 4xx reject costs 0.26s median, so a
     # cascade can afford many of them, while max_attempts=3 gave up after three
@@ -323,7 +338,12 @@ class Router:
         # free-coding-models pauses the entire provider the same way
         # (v0.5.81 provider-cooldown.js:127-135, max-of-windows).
         self._provider_pause_until = 0.0
-
+        # Per-model quota ladder: {model_id: {"level": int, "until": epoch}}.
+        # In-memory on purpose (like the provider pause): a quota window is
+        # minutes-scale, and persisting it would let one stale row bench a
+        # model across a restart for up to quota_backoff_max_s.
+        self._quota: dict[str, dict] = {}
+        self._quota_lock = threading.Lock()
     @property
     def api_key(self) -> str:
         return self._api_key() or ""
@@ -385,6 +405,60 @@ class Router:
                              "_local_fault": True}
             return 598, {"error": f"{type(e).__name__}: {e}"}
 
+    # -- quota ladder (separate from the breaker) ---------------------------
+
+    def quota_left(self, model_id: str) -> float:
+        """Seconds left on this model's quota cooldown; 0.0 if none. Read-only."""
+        with self._quota_lock:
+            q = self._quota.get(model_id)
+            return max(0.0, q["until"] - time.time()) if q else 0.0
+
+    def quota_all(self) -> dict[str, dict]:
+        """Snapshot for /mesh/status: level + seconds left per tracked model."""
+        now = time.time()
+        with self._quota_lock:
+            return {m: {"level": q["level"],
+                        "cooldown_left_s": round(max(0.0, q["until"] - now), 1)}
+                    for m, q in self._quota.items()}
+
+    def _on_quota_hit(self, model_id: str, retry_after: Optional[float]) -> float:
+        """Arm/extend the quota cooldown for one model; returns the window.
+
+        Mirrors CLIProxyAPI's 429 branch: Retry-After wins (floored, level
+        unchanged); else a still-live window is kept as-is (a burst of 429s
+        inside one window must not climb the ladder N rungs); else the
+        ladder steps. A later 429 only ever extends a window, never shortens.
+        """
+        now = time.time()
+        with self._quota_lock:
+            q = self._quota.setdefault(model_id, {"level": 0, "until": 0.0})
+            level = q["level"]
+            if retry_after is not None:
+                window = max(float(retry_after), self.cfg.quota_cooldown_floor_s)
+                until = now + window
+            elif q["until"] > now:
+                until = q["until"]
+            else:
+                cd = self.cfg.quota_backoff_base_s * (2 ** level)
+                if cd >= self.cfg.quota_backoff_max_s:
+                    cd = self.cfg.quota_backoff_max_s
+                else:
+                    level += 1
+                until = now + cd
+            q["level"] = level
+            q["until"] = max(q["until"], until)
+            window = q["until"] - now
+        logger.warning(
+            "quota-cooldown model=%s window=%.1fs level=%d (retry-after=%s)",
+            model_id, window, level, retry_after,
+        )
+        return window
+
+    def _on_quota_clear(self, model_id: str) -> None:
+        with self._quota_lock:
+            if self._quota.pop(model_id, None) is not None:
+                logger.warning("quota-cooldown model=%s cleared (success)", model_id)
+
     # -- breaker ------------------------------------------------------------
 
     def request_timeout(self, op_class: Optional[str]) -> float:
@@ -405,6 +479,9 @@ class Router:
     def eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
         if b["state"] == "gone":
+            return False
+        # Quota cooldown: separate timer, checked before the breaker. Read-only.
+        if self.quota_left(model_id) > 0:
             return False
         if b["state"] in ("auth", "down"):
             # Retry-after-cooldown, not terminal: see auth_cooldown_s. An
@@ -631,6 +708,15 @@ class Router:
                 )
             time.sleep(pause_left)
             budget -= pause_left
+        # Per-model quota cooldown: this model said 429 and its window is
+        # live. Same contract as the provider pause skip: no upstream call,
+        # no sample. Never waited out — a sibling may be free right now.
+        quota_left = self.quota_left(model_id)
+        if quota_left > 0:
+            return None, Attempt(
+                model_id, "skipped-quota-cooldown", None,
+                f"model 429 quota cooldown: {quota_left:.1f}s left",
+            )
         url = self.upstream_base + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -653,6 +739,7 @@ class Router:
             # cascade from machine-gunning the shared key through its
             # remaining candidates. max(): never shorten an armed window.
             ra = payload.pop("_retry_after_s", None) if isinstance(payload, dict) else None
+            self._on_quota_hit(model_id, ra)
             window = ra if ra is not None else self.cfg.provider_pause_default_s
             window = min(float(window), self.cfg.provider_pause_max_s)
             self._provider_pause_until = max(
@@ -708,6 +795,7 @@ class Router:
             self.index.record(model_id, op_class, source, OK, ms, payload_chars,
                               request_id=request_id)
             self._on_success(model_id)
+            self._on_quota_clear(model_id)
             return payload, Attempt(model_id, OK, ms)
 
         status = f"http-{status_code}"
@@ -760,10 +848,13 @@ class Router:
                 model_id, op_class, ms, detail or "(empty)",
             )
             return None, Attempt(model_id, status, ms, detail)
-        # transient (incl. 598 network / 599 malformed body)
+        # transient (incl. 598 network / 599 malformed body). A 429 is still
+        # recorded (score evidence) but the quota ladder above owns its
+        # cooldown: it never counts toward the failure breaker.
         self.index.record(model_id, op_class, source, status, ms, payload_chars,
                               request_id=request_id)
-        self._on_transient_fail(model_id)
+        if status_code != 429:
+            self._on_transient_fail(model_id)
         detail = str(payload.get("error", payload.get("detail", "")))[:200]
         logger.warning(
             "transient model=%s op_class=%s status=%s ms=%.0f detail=%s",

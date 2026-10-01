@@ -247,6 +247,23 @@ a failure we inflicted. Now a 429 arms a router-wide pause window:
   not about the model. A dial whose budget covers the pause waits it out
   and proceeds with the remainder.
 
+### Per-model quota cooldown ladder
+
+A 429 also arms a **per-model** quota cooldown — its own timer, separate
+from the failure breaker (a 429 never counts toward `breaker_threshold`).
+Ladder adopted from CLIProxyAPI (`sdk/cliproxy/auth/conductor_refresh.go`
+constants, `conductor_cooldown.go` `nextQuotaCooldown`):
+
+- No `Retry-After`: cooldown `quota_backoff_base_s × 2^level` (1s, 2s, 4s …),
+  capped at `quota_backoff_max_s` (30 min). The level climbs only on a 429
+  that lands after the previous window expired.
+- `Retry-After` present: cooldown `max(Retry-After, quota_cooldown_floor_s)`
+  (floor 10s); level unchanged.
+- Windows only extend. One success clears the model's ladder.
+- Inside the window the model is ineligible and a dial returns
+  `skipped-quota-cooldown` with no upstream call and no sample.
+- In-memory: a restart clears it. Visible under `quota` in `/mesh/status`.
+
 ### Discovery (daily) + probe (adaptive)
 
 - **Daily catalog sync** (launchd): `GET /v1/models` upstream, diff against
@@ -356,6 +373,9 @@ Router knobs worth knowing:
 | `router.breaker_cooldown_s` | `30` | first cooldown; doubles to `breaker_cooldown_max_s` (300) |
 | `router.provider_pause_default_s` | `5` | provider-wide pause when a 429 has no `Retry-After` |
 | `router.provider_pause_max_s` | `60` | cap on any 429 pause window, however large the header |
+| `router.quota_backoff_base_s` | `1` | first per-model 429 quota cooldown; doubles per ladder step |
+| `router.quota_backoff_max_s` | `1800` | cap on the per-model quota ladder |
+| `router.quota_cooldown_floor_s` | `10` | minimum quota cooldown when a 429 carries `Retry-After` |
 | `discovery.probe_top_n` | `6` | probe only the best N candidates per alias; `null` = whole pool |
 | `discovery.max_probes_per_pass` | `25` | hard ceiling per discovery pass |
 | `scoring.enabled` | `false` | scheduled lane scoring OFF by default (see config.py comment: http-598 mix); opt in via this file |
@@ -416,7 +436,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (328 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (344 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living

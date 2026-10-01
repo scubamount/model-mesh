@@ -73,6 +73,11 @@ DEFAULTS: dict = {
         # Provider-wide 429 pause (shared-key throttle; see RouterConfig).
         "provider_pause_default_s": 5.0,
         "provider_pause_max_s": 60.0,
+        # Per-model 429 quota ladder, separate from the breaker (CLIProxyAPI
+        # conductor_refresh.go constants; see RouterConfig).
+        "quota_backoff_base_s": 1.0,
+        "quota_backoff_max_s": 1800.0,
+        "quota_cooldown_floor_s": 10.0,
         # Attempt count must not be the binding constraint — the real-time
         # budget should be. A 4xx reject costs 0.26s median, so three cheap
         # rejects used to end a cascade with ~99% of the budget unspent.

@@ -293,7 +293,8 @@ async def health():
 
 @app.get("/mesh/status")
 async def mesh_status():
-    out: dict = {"aliases": {}, "breaker": INDEX.breaker_all()}
+    out: dict = {"aliases": {}, "breaker": INDEX.breaker_all(),
+                 "quota": ROUTER.quota_all()}
     for alias, cfg in CFG["aliases"].items():
         oc = cfg.get("op_class", "retain")
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
