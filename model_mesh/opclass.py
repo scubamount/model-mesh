@@ -96,14 +96,113 @@ EVOLVE_MESSAGES = [
 PROMPTS = {"retain": RETAIN_MESSAGES, "consolidation": CONSOLIDATION_MESSAGES,
            "reflect": REFLECT_MESSAGES, "evolve": EVOLVE_MESSAGES}
 
-# Pad probes to the op-class's real payload size.
-PAD_CHARS = {"retain": 12000, "consolidation": 12000, "reflect": 12000,
-             "evolve": 12000}
+# Pad probes toward the op-class's REAL payload size.
+#
+# These are STATIC numbers, deliberately not derived from live traffic at
+# runtime. Deriving them would close a feedback loop: traffic shapes the probe,
+# the probe decides which models the traffic goes to, and the routing then
+# changes what the traffic looks like. A static target keeps the probe an
+# independent yardstick.
+#
+# Measured 2026-10-01 over all non-probe samples in the live DB:
+#
+#   op_class       n      real p50    real p90   real p95   probe was
+#   retain      7311       12564       15432      15494     12152 (0.97x)
+#   consolidation 13366    33171       46950      68874    12152 (0.37x)
+#   reflect     22826       31758      149542     199130    12152 (0.38x)
+#   evolve        726          34        5060       5060   12152 (357x!)
+#
+# The old flat 12000 was wrong in BOTH directions. A flat pad UNDER-stated
+# consolidation and reflect by ~3x, which is the nim-proxy toy-probe defect
+# again: those lanes measure queue latency, not the work they will be handed.
+# It also OVER-stated evolve by 357x, spending a 12KB payload to probe a lane
+# whose real requests are ~34 characters -- pure waste, and it made evolve
+# probes look slower than the work they stand in for.
+#
+# Targets sit at the real p50, the size a request actually has half the time.
+# Sizing to p90 instead would make every probe cost 4x a typical request, and
+# the probe budget is shared with the 429-sensitive key.
+PAD_CHARS = {"retain": 13000, "consolidation": 33000, "reflect": 32000,
+             "evolve": 400}
 
-_FILLER = (
+# Op classes whose padded payload is a JSON STREAM (space-separated objects).
+#
+# Measured 2026-10-01, this is consolidation and NOTHING else. Its real body is
+# a `{"facts": [...], "observations": []}` envelope, so the padding continues
+# in kind. The other lanes were checked against their real payloads and are
+# NOT JSON:
+#   - retain  real chunks are prose sentences the model reduces to a facts
+#     array; 645 real retain samples average 97 chars. A JSON document there
+#     measures a shape that never arrives.
+#   - evolve  the modal real payload is 306 chars of prose (238 of 726 samples);
+#     616 real evolve samples average 141 chars. JSON padding overstates it
+#     and, worse, splices a document onto a prose body -- which is why this
+#     list has two members and not four.
+#   - reflect prose by contract.
+_JSON_OPS = {"consolidation"}
+
+_PROSE_FILLER = (
     "The operator debugged the memory daemon; the embedder runs on the GPU and "
-    "the proxy routes the retain alias to whichever model currently wins. "
+    "the proxy routes the retain alias to whichever model currently wins. ",
+    "A prior consolidation pass merged two observations about the same dive "
+    "site, so the newer record supersedes the older one. ",
+    "The nightly discovery job syncs the catalog and marks anything absent as "
+    "end-of-life, which is why the retired pool only ever shrinks. ",
 )
+
+_JSON_FACT = {
+    "text": "The operator noted a preference worth carrying forward.",
+    "context": "conversation between agent and user",
+}
+
+
+def _prose_filler(chars: int) -> str:
+    """Enough filler prose to reach `chars`, cycling the source sentences.
+
+    Cycling rather than repeating ONE sentence: a payload that is the same 118
+    characters 100 times is a shape no real request has, and a model can key
+    on the repetition instead of processing the content.
+    """
+    out: list[str] = []
+    size = 0
+    i = 0
+    while True:
+        sentence = _PROSE_FILLER[i % len(_PROSE_FILLER)]
+        if size + len(sentence) > chars:
+            break
+        out.append(sentence)
+        size += len(sentence)
+        i += 1
+    return "".join(out)
+
+
+def _json_filler(chars: int) -> str:
+    """A JSON fragment sequence of at most `chars`, shaped like real traffic.
+
+    Emits a sequence of complete JSON OBJECTS, space-separated, so the payload
+    is a valid JSON stream and every element parses on its own. The final
+    object is dropped rather than sliced: an earlier version truncated the
+    joined string at exactly `chars`, which cut the last object mid-token and
+    produced a body that would not parse -- a probe that ships a broken
+    document measures the model's error recovery, not its latency.
+
+    The objects continue consolidation's own `{"text", "context"}` fact shape,
+    so the stream is homogeneous with the envelope it follows.
+    """
+    out: list[str] = []
+    size = 0
+    i = 0
+    while True:
+        fact = dict(_JSON_FACT)
+        fact["text"] = f"{_JSON_FACT['text']} (observation {i})"
+        chunk = json.dumps(fact, separators=(",", ":"))
+        need = len(chunk) + (1 if out else 0)
+        if size + need > chars:
+            break
+        out.append(chunk)
+        size += need
+        i += 1
+    return " ".join(out)
 
 
 def probe_messages(op_class: str) -> list[dict]:
@@ -115,8 +214,15 @@ def probe_messages(op_class: str) -> list[dict]:
         user_idx = max(i for i, m in enumerate(messages) if m["role"] == "user")
         body = messages[user_idx]["content"]
         if len(body) < pad:
-            reps = (pad - len(body)) // len(_FILLER) + 1
-            messages[user_idx]["content"] = body + "\n\n" + (_FILLER * reps)[:pad]
+            room = pad - len(body)
+            # Reflect is the one lane that genuinely sends prose, so prose
+            # filler is right for it. The JSON lanes get JSON-shaped filler --
+            # appending prose after a JSON document would be a shape no real
+            # request has.
+            filler = (_json_filler(room) if op_class in _JSON_OPS
+                      else _prose_filler(room))
+            sep = "\n" if op_class in _JSON_OPS else "\n\n"
+            messages[user_idx]["content"] = body + sep + filler
     return messages
 
 
