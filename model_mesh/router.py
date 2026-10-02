@@ -136,7 +136,37 @@ class RouterConfig:
     # unrebutted is the settled signal an http reject is. Mirrored in
     # config.py DEFAULTS["router"]; test_config_defaults_match_dataclass
     # asserts the two stay in sync.
-    fidelity_fails_for_floor: int = 2
+    # Below this much remaining budget, a request-time dial is not attempted
+    # at all. `min(request_timeout, _remaining())` otherwise hands the last
+    # attempt a few seconds, and that attempt then times out for a reason that
+    # is OURS: measured live, short (<20s) http-598 samples cluster at exactly
+    # 10.0s from request and sweep sources, and those rows enter score(),
+    # success_rate and the breaker as evidence against the model.
+    #
+    # 12.0s is measured, not guessed. The artifact to fix is `min(135, left)`
+    # landing on exactly 10.0s, which it does whenever a 280s budget has two
+    # 135s dials behind it: 139 such http-598 rows exist in the last 7 days,
+    # all at 10.0s. A floor at or below 10 does not catch them, so a 5s guard
+    # would have shipped as a fix that fixes nothing.
+    #
+    # Kept far below the probe timeouts (45s / 100s) and above the cascade's
+    # own `left <= 1.0` stop. Sub-2s http-598s are genuine transport/resolver
+    # failures, not starved dials, and are deliberately still recorded.
+    min_useful_dial_s: float = 12.0
+    # Stochastic fidelity-fail cooldown. An http reject is deterministic, so
+    # it keeps REJECT_RECHECK_S: the provider parsed the body and refused the
+    # shape, so a retry fails identically. A fidelity-fail is a different
+    # failure mode — an HTTP 200 whose content did not obey the contract —
+    # and the live index shows it arrives in BURSTS: on reflect,
+    # nemotron-3-super-120b-a12b is 308 ok / 330 (93.3% healthy) with 23
+    # fidelity-fails in 7d, median inter-failure gap 241s and 8 of 23 gaps
+    # under 120s. Two adjacent fails co-occur often, and the old rule spent
+    # SEVEN DAYS of ranked depth on each burst.
+    #
+    # These are minutes-scale and in-memory, like _quota below: a transient
+    # window must not survive a restart and bench a model that is serving.
+    fidelity_cooldown_base_s: float = 60.0
+    fidelity_cooldown_max_s: float = 900.0
     # Absolute-failure gate for the thin-evidence arm of the success floor,
     # used only below min_samples_for_floor. 2 = "failed twice", which no
     # amount of missing samples explains away.
@@ -344,6 +374,112 @@ class Router:
         # model across a restart for up to quota_backoff_max_s.
         self._quota: dict[str, dict] = {}
         self._quota_lock = threading.Lock()
+        self._init_cooldown_state()
+
+    def _init_cooldown_state(self) -> None:
+        """Fidelity cooldowns: {(model_id, op_class): expiry_epoch}.
+
+        In-memory on the same reasoning as `_quota` — a transient window that
+        outlived a restart would bench a model that is demonstrably serving.
+        The lock is mandatory, not optional: `eligible()` is called
+        concurrently from `/mesh/status` and `/health` (app.py builds one
+        Router for the process), so this is a shared mutable dict read from a
+        read-only-by-contract method.
+        """
+        self._fidelity: dict[tuple[str, str], float] = {}
+        self._fidelity_level: dict[tuple[str, str], int] = {}
+        self._fidelity_strike: dict[tuple[str, str], int] = {}
+        self._fidelity_armed_at: dict[tuple[str, str], float] = {}
+        self._fidelity_lock = threading.Lock()
+        # Test seam: the production clock is time.time, but the cooldown's
+        # load-bearing property is that it DECAYS, which only a test can
+        # observe without waiting minutes.
+        self._clock = time.time
+
+    def _advance_clock(self, seconds: float) -> None:
+        """Test-only: move the cooldown clock forward."""
+        self._clock = lambda: time.time() + seconds
+
+    def _fidelity_cooldown_left(self, model_id: str, op_class: str) -> float:
+        """Seconds remaining on this model's fidelity cooldown (0 = serving).
+
+        A success recorded by ANY source clears the cooldown, not just one this
+        Router observed: the index is the record of what the model actually
+        did, and a discovery probe or a sweep that got a contract-obeying
+        answer is exactly as much evidence of recovery as a main-loop dial.
+        Relying on the in-process dial path alone would let a cooldown outlive
+        the recovery it was blind to, which is how a model gets lost for a
+        reason nobody can see in the logs.
+
+        Reads through the lock and prunes the expired entry, so the dict cannot
+        grow without bound across a long-lived process.
+        """
+        key = (model_id, op_class)
+        now = self._clock()
+        with self._fidelity_lock:
+            until = self._fidelity.get(key)
+            if until is None:
+                return 0.0
+            armed_at = self._fidelity_armed_at.get(key)
+        if armed_at is not None:
+            try:
+                last_ok = self.index.last_success_ts(model_id, op_class)
+            except Exception:      # never let telemetry break eligibility
+                last_ok = None
+            if last_ok is not None and last_ok > armed_at:
+                self._fidelity_succeed(model_id, op_class)
+                return 0.0
+        if until <= now:
+            self._fidelity_succeed(model_id, op_class)
+            return 0.0
+        return until - now
+
+    def _fidelity_fail(self, model_id: str, op_class: str) -> None:
+        """Arm (or re-arm) the cooldown after a fidelity violation.
+
+        Only the FIRST violation in a window extends it: a burst must not
+        ratchet a model into an escalating penalty. A model that fails twice
+        while already cooling down is not new information.
+        """
+        key = (model_id, op_class)
+        now = self._clock()
+        with self._fidelity_lock:
+            # Already cooling: a burst must not ratchet the penalty, and the
+            # strike count is irrelevant while a window is live.
+            if self._fidelity.get(key, 0.0) > now:
+                return
+            # TWO consecutive violations are still the trigger, unchanged from
+            # the gate this replaces. One empty-content 200 during a provider
+            # burst is not a verdict — the cascade already absorbed it, and
+            # these models run 93.3% ok. Only the WINDOW was wrong.
+            strikes = self._fidelity_strike.get(key, 0) + 1
+            self._fidelity_strike[key] = strikes
+            if strikes < 2:
+                return
+            # Failing again AFTER the window expired escalates (60s, 120s,
+            # 240s ... capped at fidelity_cooldown_max_s), so a persistently
+            # non-compliant model backs off further while a one-off burst pays
+            # the base window only. A success resets the ladder entirely.
+            level = self._fidelity_level.get(key, 0)
+            self._fidelity_level[key] = level + 1
+            window = min(self.cfg.fidelity_cooldown_max_s,
+                         self.cfg.fidelity_cooldown_base_s * (2 ** level))
+            self._fidelity[key] = now + window
+            self._fidelity_armed_at[key] = now
+
+    def _fidelity_succeed(self, model_id: str, op_class: str) -> None:
+        """Any contract-obeying answer ends the cooldown immediately.
+
+        Waiting out a window while the model is demonstrably answering is the
+        failure mode this replaces, and a success also resets the strike
+        counter and the escalation ladder.
+        """
+        key = (model_id, op_class)
+        with self._fidelity_lock:
+            self._fidelity.pop(key, None)
+            self._fidelity_level.pop(key, None)
+            self._fidelity_strike.pop(key, None)
+            self._fidelity_armed_at.pop(key, None)
     @property
     def api_key(self) -> str:
         return self._api_key() or ""
@@ -524,15 +660,15 @@ class Router:
             # eligible=True and burned a cascade slot on every memory op.
             if self.index.unrebutted_reject(model_id, op_class) is not None:
                 return False
-            # Fidelity floor, sibling of the reject floor above. An http reject
-            # is deterministic; a broken-JSON/empty-content 200 is usually
-            # stochastic, so ONE violation is not a verdict (the cascade
-            # already absorbed it). `fidelity_fails_for_floor` consecutive
-            # violations with no intervening success IS settled evidence, and
-            # the same REJECT_RECHECK_S window buys the weekly retry.
-            if self.index.unrebutted_fidelity_fails(
-                model_id, op_class, need=self.cfg.fidelity_fails_for_floor,
-            ) is not None:
+            # Fidelity cooldown, deliberately NOT the reject gate above.
+            # An http reject is deterministic and keeps REJECT_RECHECK_S. A
+            # fidelity-fail is a 200 that broke the contract, and it bursts:
+            # on reflect the gate armed 3x in 24h on a model that was 93.3%
+            # healthy overall, so a seven-day window was spending ranked depth
+            # on transient provider behaviour. Short, in-memory, decayed by the
+            # clock, cleared by any success — and cleared on restart, because
+            # a stale row must never bench a model that is serving.
+            if self._fidelity_cooldown_left(model_id, op_class) > 0.0:
                 return False
             s = self.index.score(model_id, op_class)
             if (s is not None
@@ -791,9 +927,17 @@ class Router:
                     model_id, op_class, source, payload_chars, why,
                     _sys, _last[-300:], _got,
                 )
+                # Arm the short cooldown, NOT the reject gate. A second
+                # consecutive failure inside a live window deliberately does
+                # not extend it — see _fidelity_fail.
+                self._fidelity_fail(model_id, op_class)
                 return payload, Attempt(model_id, FIDELITY_FAIL_STATUS, ms, why)
             self.index.record(model_id, op_class, source, OK, ms, payload_chars,
                               request_id=request_id)
+            # A contract-obeying answer clears any live fidelity cooldown, so a
+            # recovered model rejoins the cascade immediately rather than
+            # waiting out a window it has already disproved.
+            self._fidelity_succeed(model_id, op_class)
             self._on_success(model_id)
             self._on_quota_clear(model_id)
             return payload, Attempt(model_id, OK, ms)
@@ -987,15 +1131,23 @@ class Router:
         def _remaining() -> float:
             return deadline - time.monotonic()
 
-        def _dial(mid: str, source: str) -> tuple[bool, Attempt, Optional[dict]]:
+        def _dial(mid: str, source: str,
+                   grant_s: Optional[float] = None) -> tuple[bool, Attempt, Optional[dict]]:
             """One upstream call that counts only if the body is usable.
             Fidelity failures return a payload but must not end the cascade:
             the client would receive output its own parser rejects. This one
             predicate is the whole cascade — main loop and re-probe retries
-            share it, so neither arm can drift into accepting prose."""
+            share it, so neither arm can drift into accepting prose.
+
+            `grant_s` MUST be passed by request-time callers: the caller has
+            already compared the remaining budget against
+            min_useful_dial_s, and letting _dial re-read the clock here leaves
+            a window in which time passes between that check and this dial.
+            Re-reading is how a 10s dial slipped past a 12s guard."""
             payload, att = self.dial(
                 mid, body, op_class, source=source,
-                timeout=min(self.request_timeout(op_class), _remaining()),
+                timeout=min(self.request_timeout(op_class),
+                            grant_s if grant_s is not None else _remaining()),
                 request_id=request_id,
             )
             result.attempts.append(att)   # telemetry: EVERY dial is recorded
@@ -1012,7 +1164,17 @@ class Router:
                             "cascade budget exhausted")
                 )
                 break
-            ok, att, payload = _dial(model_id, "request")
+            # Our budget, not the model's fault: do not spend the last few
+            # seconds on a dial that cannot finish, and above all do not
+            # record the resulting timeout as evidence against this model.
+            if left < self.cfg.min_useful_dial_s:
+                result.attempts.append(
+                    Attempt(model_id, "skipped-budget", None,
+                            f"remaining budget {left:.1f}s below "
+                            f"min_useful_dial_s {self.cfg.min_useful_dial_s}s")
+                )
+                break
+            ok, att, payload = _dial(model_id, "request", grant_s=left)
             if ok:
                 result.ok, result.model_id, result.response = (
                     True, model_id, payload,
@@ -1050,6 +1212,20 @@ class Router:
                 # stale, and a restored credential is exactly that case.
                 if b["state"] == "gone":
                     continue
+                # A probe is a REQUEST-TIME call in disguise — it dials the
+                # upstream and its timeout comes out of the same budget. It
+                # was issuing grants as small as 4-8s once earlier arms had
+                # drained the budget, and those dials were recorded exactly
+                # like the main loop's starved dials. Same floor applies.
+                probe_left = min(_remaining(), _box_left())
+                if probe_left < self.cfg.min_useful_dial_s:
+                    result.attempts.append(
+                        Attempt(model_id, "skipped-budget", None,
+                                f"re-probe budget {probe_left:.1f}s below "
+                                f"min_useful_dial_s "
+                                f"{self.cfg.min_useful_dial_s}s")
+                    )
+                    continue
                 if self.probe(model_id, op_class, probe_messages,
                               timeout=min(self.probe_timeout(op_class),
                                           _remaining(), _box_left())):
@@ -1063,7 +1239,17 @@ class Router:
                                 "cascade budget exhausted")
                     )
                     continue
-                ok, att, payload = _dial(model_id, "request")
+                # Same rule as the main loop: a retry that cannot finish is
+                # skipped rather than charged to the model as a timeout.
+                if left < self.cfg.min_useful_dial_s:
+                    result.attempts.append(
+                        Attempt(model_id, "skipped-budget", None,
+                                f"remaining budget {left:.1f}s below "
+                                f"min_useful_dial_s "
+                                f"{self.cfg.min_useful_dial_s}s")
+                    )
+                    continue
+                ok, att, payload = _dial(model_id, "request", grant_s=left)
                 if ok:
                     result.reprobed = reprobed_any
                     result.ok, result.model_id, result.response = (
@@ -1098,14 +1284,29 @@ class Router:
                         model_id)["state"] == "gone":
                     continue
                 left = _remaining()
-                if left <= 1.0:
+                if left <= 1.0 or left < self.cfg.min_useful_dial_s:
+                    # Same rule as the main loop: the sweep wins real requests
+                    # in 0.9-2.0s, so this floor is deliberately low, but a
+                    # dial that cannot finish must not be charged to the
+                    # model as a failure.
+                    #
+                    # `continue`, not `break`: budget does not come back, so
+                    # no LATER model can be afforded either, but recording a
+                    # skipped-budget attempt for each of them is what tells an
+                    # operator how deep the sweep actually got. `break` here
+                    # stopped the arm after the first unaffordable model and
+                    # silently truncated its own reach.
                     result.attempts.append(
                         Attempt(model_id, "skipped-budget", None,
-                                "cascade budget exhausted")
+                                f"remaining budget {left:.1f}s below "
+                                f"min_useful_dial_s "
+                                f"{self.cfg.min_useful_dial_s}s")
                     )
-                    break
+                    continue
                 payload, att = self.dial(
                     model_id, body, op_class, source="sweep",
+                    # `left` is the value the guard above compared; re-reading
+                    # the clock here is what let starved dials through.
                     timeout=min(self.request_timeout(op_class), left),
                     request_id=request_id,
                 )

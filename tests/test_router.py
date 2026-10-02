@@ -497,6 +497,14 @@ def test_cascade_respects_total_budget(index):
 
 
 def test_per_attempt_timeout_shrinks_to_remaining_budget(index):
+    """The per-attempt grant never exceeds what is left of the budget.
+
+    The budget here is 60s rather than the original 10s: `min_useful_dial_s`
+    (12s) now stops the cascade from issuing a dial it cannot finish, so a 10s
+    total budget sits entirely below the floor and nothing would be attempted
+    at all. That behaviour is pinned separately in test_starved_dial.py; this
+    test is about the SHRINKING, which needs at least one affordable dial.
+    """
     seen = []
 
     def capture(url, body, headers, timeout):
@@ -504,10 +512,13 @@ def test_per_attempt_timeout_shrinks_to_remaining_budget(index):
         return 500, {}
     r = Router(index, "http://up/v1", "k",
                RouterConfig(max_attempts=3, request_timeout_s=120.0,
-                            total_budget_s=10.0),
+                            total_budget_s=60.0),
                transport=capture)
     r.route(["m1", "m2", "m3"], {"messages": []}, "retain")
-    assert seen and all(t <= 10.0 for t in seen)
+    assert seen and all(t <= 60.0 for t in seen)
+    # The point of the test: later attempts get LESS than the first, because
+    # each dial consumes the shared budget.
+    assert seen == sorted(seen, reverse=True), seen
 
 
 # --- credential-loss recovery (brick-class bug) ------------------------------

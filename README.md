@@ -161,11 +161,24 @@ edit), are a prior rather than a verdict, and are overridable per model id via
 Before ranking, a model must pass per-op_class floors — all measured, none
 guessed:
 
-- **Fidelity gate**: a 200 whose body violates the op_class JSON contract is
-  recorded as `fidelity-fail` (a FAILED sample, never a success) and never
-  returned to the client. Two unrebutted violations drop the model from that
-  op_class (`fidelity_fails_for_floor`) until one success intervenes or the
-  weekly recheck elapses.
+- **Fidelity cooldown**: a 200 whose body violates the op_class JSON contract
+  is recorded as `fidelity-fail` (a FAILED sample, never a success) and never
+  returned to the client. Two consecutive unrebutted violations drop the model
+  from that op_class for `fidelity_cooldown_base_s` (60s), escalating to
+  `fidelity_cooldown_max_s` (900s) if it keeps failing once each window
+  elapses. **One success from any source clears it immediately**, and a daemon
+  restart clears it too — it is in-memory on purpose.
+
+  This is deliberately NOT the capability-reject window below. A reject is
+  deterministic and earns seven days; a fidelity-fail is a 200 that broke the
+  contract, which arrives in **bursts** on otherwise-healthy models (measured:
+  one model at 93.3% ok on reflect, 23 fidelity-fails in 7d, median
+  inter-failure gap 241s, 8 of 23 gaps under 120s). The seven-day window spent
+  ranked depth on transient provider behaviour — on an 11-model pool it left
+  `auto/reflect` with `ranked=1`, and 96 of 123 client failures in a day died
+  after exactly two dials because the main loop had one candidate to give.
+  Unlike the reject gate, this cooldown is per-`(model, op_class)`: a model can
+  obey one contract and not another.
 - **Capability reject**: HTTP 400/413/422 means the provider parsed and
   refused the request shape — deterministic, retry pointless. Excluded from
   the op_class after two occurrences; the model stays eligible for others.
@@ -368,7 +381,8 @@ Router knobs worth knowing:
 | `router.max_p95_ms_for_eligibility` | `75000` | latency-floor FLOOR (per-op_class ceiling derives upward from the request budget); measured p95_all_ms above it excludes the model |
 | `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the size heuristic misjudges |
 | `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
-| `router.fidelity_fails_for_floor` | `2` | unrebutted contract violations → excluded |
+| `router.fidelity_cooldown_base_s` | `60.0` | 2 consecutive contract violations → out of ranking |
+| `router.fidelity_cooldown_max_s` | `900.0` | escalation cap for repeat offenders |
 | `router.breaker_threshold` | `3` | consecutive fails before a model opens its breaker |
 | `router.breaker_cooldown_s` | `30` | first cooldown; doubles to `breaker_cooldown_max_s` (300) |
 | `router.provider_pause_default_s` | `5` | provider-wide pause when a 429 has no `Retry-After` |
@@ -436,7 +450,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (344 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (379 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living

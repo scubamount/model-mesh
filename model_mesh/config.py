@@ -152,11 +152,16 @@ DEFAULTS: dict = {
         "min_success_rate": 0.5,
         "min_samples_for_floor": 4,
         "min_failures_for_thin_floor": 2,
-        # Consecutive fidelity violations (200 with a body violating the
-        # op_class JSON contract) that drop a model from an op_class. Must
-        # match RouterConfig.fidelity_fails_for_floor; the defaults-match test
-        # asserts the two files agree.
-        "fidelity_fails_for_floor": 2,
+        # Stochastic fidelity-fail cooldown: how long a 200-that-broke-the-
+        # contract keeps a model out of the ranked order for that op_class.
+        # Minutes, not the reject gate's 7 days — fidelity failures burst on
+        # otherwise-healthy models (93.3% ok on reflect), so a long window
+        # spends ranked depth on transient provider behaviour. Must match
+        # RouterConfig.fidelity_cooldown_base_s / _max_s; the defaults-match
+        # test asserts the two files agree.
+        "min_useful_dial_s": 12.0,
+        "fidelity_cooldown_base_s": 60.0,
+        "fidelity_cooldown_max_s": 900.0,
         # Must satisfy 2 * this < total_budget_s so a slow model can't consume
         # the cascade; test_deployment_contract.py asserts the relationship.
         "max_p95_ms_for_eligibility": 75000.0,
