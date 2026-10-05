@@ -346,6 +346,10 @@ class RouteResult:
     attempts: list[Attempt] = field(default_factory=list)
     reprobed: bool = False
     swept: bool = False
+    # model_id -> exclusion_reason() for every pool member ranking left out,
+    # as evaluated for THIS request. The per-request record of which gate
+    # excluded what; app.py appends it to audit/exclusions.jsonl.
+    excluded: dict[str, str] = field(default_factory=dict)
 
 
 class Router:
@@ -616,12 +620,36 @@ class Router:
         return self.cfg.probe_timeout_for(op_class)
 
     def eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
+        """True when the model may take ranked traffic. See exclusion_reason."""
+        return self.exclusion_reason(model_id, op_class) is None
+
+    # The names exclusion_reason() returns, in the order it checks them. The
+    # first matching gate wins, so a model is counted once, against the gate
+    # that actually excluded it -- the number an operator needs to decide
+    # whether a gate is worth what it costs (the p95-ceiling question).
+    EXCLUSION_REASONS = (
+        "gone", "quota_cooldown", "breaker_cooldown", "reject",
+        "fidelity_cooldown", "success_floor", "thin_evidence_floor",
+        "latency_floor", "budget_floor",
+    )
+
+    def exclusion_reason(
+        self, model_id: str, op_class: Optional[str] = None,
+    ) -> Optional[str]:
+        """Why this model is NOT eligible, or None when it is.
+
+        The ONE eligibility predicate: eligible() is `exclusion_reason() is
+        None`, and /mesh/status counts the reasons. Counting from a second
+        copy of these gates would let the counters describe a predicate the
+        router no longer runs -- the drift that already happened once, when
+        README described a latency floor the code had reverted.
+        """
         b = self.index.breaker_get(model_id)
         if b["state"] == "gone":
-            return False
+            return "gone"
         # Quota cooldown: separate timer, checked before the breaker. Read-only.
         if self.quota_left(model_id) > 0:
-            return False
+            return "quota_cooldown"
         if b["state"] in ("auth", "down"):
             # Retry-after-cooldown, not terminal: see auth_cooldown_s. An
             # unexpired cooldown is the whole answer — the model is serving
@@ -632,7 +660,7 @@ class Router:
             # the breaker table. The actual flip to `recovering` happens in
             # dial() at attempt time (see _transition_for_attempt).
             if time.time() < b["cooldown_until"]:
-                return False
+                return "breaker_cooldown"
             # Cooldown expired => the model gets to be CONSIDERED again, which
             # is not the same as being admitted. This used to `return True`,
             # and that early return sat ABOVE every floor below, so opening the
@@ -662,7 +690,7 @@ class Router:
             # we ask for 4096 completion tokens) sat at n=1, success_rate=0.0,
             # eligible=True and burned a cascade slot on every memory op.
             if self.index.unrebutted_reject(model_id, op_class) is not None:
-                return False
+                return "reject"
             # Fidelity cooldown, deliberately NOT the reject gate above.
             # An http reject is deterministic and keeps REJECT_RECHECK_S. A
             # fidelity-fail is a 200 that broke the contract, and it bursts:
@@ -672,12 +700,12 @@ class Router:
             # clock, cleared by any success — and cleared on restart, because
             # a stale row must never bench a model that is serving.
             if self._fidelity_cooldown_left(model_id, op_class) > 0.0:
-                return False
+                return "fidelity_cooldown"
             s = self.index.score(model_id, op_class)
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
                     and s.success_rate < self.cfg.min_success_rate):
-                return False
+                return "success_floor"
             # Thin-evidence failure floor. The floor above waits for
             # min_samples_for_floor (4) samples, which is the right caution
             # for a model that has merely been unlucky. It is the wrong
@@ -707,7 +735,7 @@ class Router:
                 if (successes >= 1
                         and failures >= self.cfg.min_failures_for_thin_floor
                         and s.success_rate < self.cfg.min_success_rate):
-                    return False
+                    return "thin_evidence_floor"
             # Latency floor. Success rate alone is not enough: a model can sit
             # above the success floor and still be unusable because a single
             # attempt eats the whole cascade budget. Observed 2026-08-07 —
@@ -739,7 +767,7 @@ class Router:
             if (s is not None
                     and s.n >= self.cfg.min_samples_for_floor
                     and s.p95_ms > self.cfg.latency_ceiling_ms(op_class)):
-                return False
+                return "latency_floor"
             # Budget floor, sibling of the one above and a DIFFERENT question:
             # "counting the overload it actually suffers, can the cascade afford
             # to dial this model AND still retry?" A model can be fast when it
@@ -759,8 +787,8 @@ class Router:
                 expected_ms = (s.success_rate * s.p95_ms
                                + (1.0 - s.success_rate) * timeout_ms)
                 if expected_ms + timeout_ms > self.cfg.total_budget_s * 1000.0:
-                    return False
-        return True  # healthy | recovering
+                    return "budget_floor"
+        return None  # healthy | recovering: eligible
 
     def _on_success(self, model_id: str) -> None:
         prev = self.index.breaker_get(model_id)["state"]
@@ -1045,9 +1073,20 @@ class Router:
         Unknowns rank above FAILING but below anything healthy: a model with no
         evidence is a maybe, and a maybe beats a model measured to be broken.
         """
+        return self.ranked_with_reasons(candidates, op_class)[0]
+
+    def ranked_with_reasons(
+        self, candidates: list[str], op_class: str,
+    ) -> tuple[list[str], dict[str, str]]:
+        """ranked() plus the reason each excluded candidate was left out --
+        one pass over exclusion_reason(), so the reasons ARE the ranking's own
+        decisions rather than a second evaluation that could disagree."""
         eligible = []
+        excluded: dict[str, str] = {}
         for m in candidates:
-            if not self.eligible(m, op_class):
+            why = self.exclusion_reason(m, op_class)
+            if why is not None:
+                excluded[m] = why
                 continue
             eligible.append((m, self.index.score(m, op_class)))
         eligible.sort(
@@ -1055,7 +1094,7 @@ class Router:
                 t[0], t[1], self.cfg.overload_p95_ms, self.cfg.tier_overrides
             )
         )
-        return [m for m, _ in eligible]
+        return [m for m, _ in eligible], excluded
 
     # -- probe (used by the re-probe arm and discovery) ----------------------
 
@@ -1172,7 +1211,7 @@ class Router:
                 return True, att, payload
             return False, att, None
 
-        order = self.ranked(candidates, op_class)
+        order, result.excluded = self.ranked_with_reasons(candidates, op_class)
         for model_id in order[: self.cfg.max_attempts]:
             left = _remaining()
             if left <= 1.0:

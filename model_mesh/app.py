@@ -190,6 +190,7 @@ async def chat_completions(request: Request):
     result = await asyncio.to_thread(
         ROUTER.route, pool, body, op_class, probe_messages(op_class)
     )
+    _record_exclusions(model, op_class, len(pool), result)
     if result.ok:
         resp = JSONResponse(result.response)
         resp.headers["x-mesh-routed-model"] = result.model_id or ""
@@ -298,7 +299,7 @@ async def mesh_status():
     for alias, cfg in CFG["aliases"].items():
         oc = cfg.get("op_class", "retain")
         pool = candidates_for(INDEX, CFG["provider"]["name"], cfg)
-        ranked = ROUTER.ranked(pool, oc)
+        ranked, excluded = ROUTER.ranked_with_reasons(pool, oc)
         # Score EVERY model in the POOL that has evidence — not just the ones
         # that survived ranking. A truncated view is how the 2026-08-08
         # eviction hid: a model with 36/36 successes fell to rank 13 and simply
@@ -354,6 +355,12 @@ async def mesh_status():
             "max_candidates": None,
             "scores": scores,
             "rank_inputs": rank_inputs,
+            # Which gate left each pool member out, from the same predicate
+            # ranking runs (Router.exclusion_reason), plus the tally. Answers
+            # "is this gate costing us depth?" from evidence rather than from
+            # one model's snapshot -- the open p95-ceiling question.
+            "excluded": excluded,
+            "excluded_by": _tally(excluded.values()),
             # The timeouts THIS op_class actually runs under, read off the live
             # router rather than restated from config. Added 2026-08-24: the
             # per-op_class override that fixed auto/consolidation could not be
@@ -468,10 +475,105 @@ async def mesh_score():
 
 
 
+def _tally(reasons) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in reasons:
+        out[r] = out.get(r, 0) + 1
+    return out
+
+
+_EXCLUSIONS_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _record_exclusions(alias: str, op_class: str, pool_size: int,
+                       result) -> None:
+    """One line per routed request: which gate excluded how many pool members,
+    and how the request ended. A week of these answers whether a gate (the
+    p95 latency ceiling in particular) is costing ranked depth on requests
+    that then fail -- the evidence a /mesh/status snapshot cannot give.
+
+    Counts only, never model payloads. Best-effort: a write failure must
+    never fail the request it describes."""
+    path = _state_dir() / "audit" / "exclusions.jsonl"
+    try:
+        # Size cap with one rollover. Unlike discovery/scoring (a few lines a
+        # day), this writes per REQUEST -- ~4k/day measured -- so uncapped it
+        # grows ~300 MB a year on a daemon nobody watches. 20 MB holds weeks.
+        if path.is_file() and path.stat().st_size > _EXCLUSIONS_MAX_BYTES:
+            path.replace(path.with_suffix(".jsonl.1"))
+        _audit(path, {
+            "ts": time.time(),
+            "alias": alias,
+            "op_class": op_class,
+            "pool": pool_size,
+            "ranked": pool_size - len(result.excluded),
+            "excluded_by": _tally(result.excluded.values()),
+            "ok": result.ok,
+            "attempts": len(result.attempts),
+            "swept": result.swept,
+            "reprobed": result.reprobed,
+        })
+    except OSError:
+        logger.exception("exclusions audit write failed")
+
+
 def _audit(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(record, default=str) + "\n")
+
+
+@app.get("/mesh/exclusions")
+async def mesh_exclusions(hours: float = 168.0):
+    """Exclusion evidence over a window (default one week), per alias.
+
+    `excluded_by[gate]`  -- model-exclusions by that gate, over ALL requests.
+    `failed_excluded_by[gate]` -- the same count, over FAILED requests only.
+    `failed_requests_with[gate]` -- failed REQUESTS on which that gate
+        excluded at least one model.
+    Read the failed-* numbers before loosening a gate: if a gate is rarely
+    present on failed requests, loosening it buys nothing.
+
+    The file can be tens of MB, so it is read off the event loop -- parsing it
+    inline would stall /health and every routed request behind it."""
+    return await asyncio.to_thread(_summarise_exclusions, hours)
+
+
+def _summarise_exclusions(hours: float) -> dict:
+    cutoff = time.time() - hours * 3600.0
+    path = _state_dir() / "audit" / "exclusions.jsonl"
+    files = [p for p in (path.with_suffix(".jsonl.1"), path) if p.is_file()]
+    per: dict = {}
+    skipped = 0
+    for f in files:
+        with f.open() as fh:                    # streamed, never read whole
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    skipped += 1
+                    continue
+                # One malformed line must not 500 the whole window.
+                if not isinstance(rec, dict) or not rec.get("alias"):
+                    skipped += 1
+                    continue
+                if rec.get("ts", 0) < cutoff:
+                    continue
+                a = per.setdefault(rec["alias"], {
+                    "requests": 0, "failed": 0, "excluded_by": {},
+                    "failed_excluded_by": {}, "failed_requests_with": {},
+                })
+                failed = not rec.get("ok")
+                a["requests"] += 1
+                a["failed"] += failed
+                for reason, n in (rec.get("excluded_by") or {}).items():
+                    a["excluded_by"][reason] = a["excluded_by"].get(reason, 0) + n
+                    if failed:
+                        a["failed_excluded_by"][reason] = (
+                            a["failed_excluded_by"].get(reason, 0) + n)
+                        a["failed_requests_with"][reason] = (
+                            a["failed_requests_with"].get(reason, 0) + 1)
+    return {"hours": hours, "aliases": per, "skipped_lines": skipped}
 
 
 @app.get("/mesh/discovery")

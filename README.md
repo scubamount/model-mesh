@@ -341,6 +341,16 @@ unpredictably:
 - `GET /mesh/discovery` — recent discovery runs: timestamp, duration, and the
   `new`/`eol`/`returned`/`probed` sets per pass. The churn record the whole
   probe design exists for.
+- `GET /mesh/exclusions?hours=168` — which eligibility gate excluded how many
+  pool members, per alias, over a window (default one week).
+  `excluded_by[gate]` counts model-exclusions over all requests and
+  `failed_excluded_by[gate]` the same over failed requests;
+  `failed_requests_with[gate]` counts failed *requests* on which that gate
+  excluded at least one model. Read the failed-* numbers before loosening a
+  gate: a gate rarely present on failures buys nothing when loosened. Fed by one line
+  per routed request in `audit/exclusions.jsonl` (counts only, no payloads;
+  20 MB cap with one rollover). `/mesh/status` carries the same per-model
+  `excluded` map and `excluded_by` tally for the current instant.
 - `GET /health` — **deep** health = *can the mesh serve*: `healthy` when ≥1
   eligible model per alias; `degraded` (still 200) when the floors admit
   nobody but the pool produced an OK inside 30 min — whole-pool overload is
@@ -458,7 +468,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (409 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (430 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
