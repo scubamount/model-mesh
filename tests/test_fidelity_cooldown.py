@@ -31,18 +31,20 @@ from model_mesh.router import Router, RouterConfig
 
 
 class FakeIndex:
-    """Minimal index stand-in: eligible() only needs the two reject queries."""
+    """Minimal index stand-in for eligible().
 
-    def __init__(self, reject=None, fidelity=0):
+    It deliberately has NO fidelity-gate query. The DB-backed
+    `unrebutted_fidelity_fails` 7-day gate was deleted, and a router that
+    reached for it again would AttributeError here instead of silently reading
+    a stub -- the stub used to be how a regression could hide.
+    """
+
+    def __init__(self, reject=None):
         self._reject = reject
-        self._fidelity = fidelity
         self.breaker_get_calls = []
 
     def unrebutted_reject(self, model_id, op_class):
         return self._reject
-
-    def unrebutted_fidelity_fails(self, model_id, op_class, need=2):
-        return self._fidelity if self._fidelity >= need else None
 
     def score(self, model_id, op_class):
         return None
@@ -72,7 +74,7 @@ def cfg():
 def router(cfg):
     r = Router.__new__(Router)
     r.cfg = cfg
-    r.index = FakeIndex(fidelity=2)   # the DB already holds two consecutive fails
+    r.index = FakeIndex()
     # eligible() also consults the quota ladder, so the stub Router needs the
     # real __init__ attributes for every state it touches.
     r._quota = {}

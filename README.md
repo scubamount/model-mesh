@@ -187,10 +187,18 @@ guessed:
 - **Latency floor**: measured p95 above the op_class's derived ceiling
   (`latency_ceiling_ms`, ≥ 75s, = request budget × headroom, capped at half
   `total_budget_s`) excludes the model — an attempt must be able to run twice
-  inside the budget. It reads the **failure-inclusive** p95 (`p95_all_ms`):
-  a model whose successes are fast but whose timeouts eat the attempt budget
-  is exactly what this floor exists to exclude, and the successes-only p95
-  (which ranking keeps, for "behaving when up") hides it.
+  inside the budget. It reads the **successes-only** p95 (`p95_ms`): "when this
+  model works, is one success affordable?" It must NOT read the
+  failure-inclusive `p95_all_ms` — a timeout sample records the per-attempt
+  timeout and the ceiling is a fraction of that same timeout, so every model
+  that ever timed out failed by construction. Shipped that way on 2026-09-13,
+  it collapsed reflect to 1 of 10 models within 16 hours (reverted in
+  `17f8eca`). A model whose timeouts eat the budget is caught instead by the
+  breaker and by the budget floor below.
+- **Budget floor**: once a model has `min_samples_for_floor` samples, its
+  expected dial cost (`success_rate × p95_ms + (1 − success_rate) ×
+  request_timeout`, using the op_class's own request timeout) plus one more
+  full attempt must fit inside `total_budget_s`.
 
 Floors are caution, not verdicts: when they exclude everything, the sweep arm
 (arm 3 below) still tries them, because a total miss means the caution already
@@ -378,7 +386,7 @@ Router knobs worth knowing:
 | `router.probe_timeout_s` | `45` | probe attempt ceiling |
 | `router.probe_timeout_s_by_op_class` | `{consolidation: 100}` | per-op_class probe override |
 | `router.overload_p95_ms` | `20000` | p95 at/above this = overloaded → demoted |
-| `router.max_p95_ms_for_eligibility` | `75000` | latency-floor FLOOR (per-op_class ceiling derives upward from the request budget); measured p95_all_ms above it excludes the model |
+| `router.max_p95_ms_for_eligibility` | `75000` | latency-floor FLOOR (per-op_class ceiling derives upward from the request budget); measured successes-only `p95_ms` above it excludes the model |
 | `router.tier_overrides` | `{}` | `{model_id: 1..5}` when the size heuristic misjudges |
 | `router.min_success_rate` | `0.5` | eligibility floor (with `min_samples_for_floor`=4) |
 | `router.fidelity_cooldown_base_s` | `60.0` | 2 consecutive contract violations → out of ranking |
@@ -450,7 +458,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (400 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (409 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living

@@ -133,11 +133,15 @@ class Score:
     spike_rate: float
     success_rate: float
     n: int
-    # Failure-inclusive p95. p95_ms answers "how does this model behave when it
-    # works" (ordering); p95_all_ms answers "what did its worst recent attempt
-    # cost" (eligibility). A model alternating fast successes and full-budget
-    # timeouts hides entirely from p95_ms. Observed 2026-09-13: gemma/reflect
-    # 2,043 http-598 samples averaging 81s, invisible to the latency floor.
+    # Failure-inclusive p95: "what did its worst recent attempt cost". An
+    # OBSERVABILITY field, published via /mesh/status -- NOT an eligibility
+    # input. It was briefly fed to the latency floor (2026-09-13) and collapsed
+    # every lane within 16h, because a timeout sample records the per-attempt
+    # timeout and the ceiling is a fraction of that same timeout; reverted in
+    # 17f8eca. The cost it exposes is charged by the breaker and by the
+    # budget floor's expected-cost term in router.eligible(), which uses
+    # success_rate, not this field. Keep it visible: gemma/reflect's 2,043
+    # http-598s averaging 81s were invisible in p95_ms alone.
     p95_all_ms: float = 0.0
 
 
@@ -379,28 +383,6 @@ class Index:
         """
         return self._latest_unrebutted(model_id, op_class, REJECT_STATUSES, recheck_s)
 
-    def unrebutted_fidelity_fails(
-        self, model_id: str, op_class: str, need: int = 2,
-        recheck_s: float = REJECT_RECHECK_S,
-    ) -> Optional[float]:
-        """Timestamp when the last `need` samples for an op_class ALL violated
-        the fidelity contract, provided no later success rebuts them.
-
-        Unlike an http reject, a fidelity failure is stochastic: a model may
-        leak prose once under load and comply the next minute. One strike must
-        not exile it (that is what the cascade is for — the client was already
-        served by the next candidate), but `need` consecutive violations with no
-        intervening success is the same deterministic signal an http reject is,
-        and the same recheck window applies.
-
-        This gate is what keeps a prose-leaking model OUT of the ranking during
-        that window; recording the failures as non-ok samples is what eventually
-        demotes it through the ordinary success-rate floor.
-        """
-        return self._latest_unrebutted(
-            model_id, op_class, (FIDELITY_FAIL_STATUS,), recheck_s, need=need
-        )
-
     def _latest_unrebutted(
         self, model_id: str, op_class: str, statuses: tuple,
         recheck_s: float, need: int = 1,
@@ -434,9 +416,11 @@ class Index:
         Returns the raw measurements — p95, jitter, spike-rate, success-rate,
         sample count — and does NOT reduce them to a single number. Ranking is
         `quality.rank_key()`, which reads these fields directly. Which latency
-        view is which: p95_ms = successes-only ("behaving when up", ranking);
-        p95_all_ms = every attempt ("what dialling it costs", the eligibility
-        floor in router.eligible()). Merging them re-hides the alternator.
+        view is which: p95_ms = successes-only ("behaving when up") -- read by
+        ranking AND by the latency floor in router.eligible(); p95_all_ms =
+        every attempt ("what dialling it costs"), observability only. Merging
+        them re-hides the alternator; feeding p95_all_ms to the floor
+        collapsed every lane (17f8eca).
 
         There used to be a blended float here (0.30 p95 + 0.30 jitter + 0.20
         spike + 0.20 success, with confidence shrinkage toward a neutral prior).

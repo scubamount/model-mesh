@@ -652,10 +652,10 @@ def test_fidelity_fail_cascades_instead_of_serving_prose(index):
     assert [a.status for a in res.attempts] == ["fidelity-fail", "ok"]
 
 
-def test_two_unrebutted_fidelity_fails_drop_model_from_ranking(index):
-    """Two consecutive contract violations with no success between them is the
-    settled signal an http reject is: the model leaves the cascade until the
-    recheck window elapses or a success intervenes."""
+def test_two_consecutive_fidelity_fails_drop_model_from_ranking(index):
+    """Two consecutive contract violations arm the fidelity cooldown: the model
+    leaves ranked order until the cooldown expires or a success intervenes.
+    (Duration and decay are pinned in test_fidelity_cooldown.py.)"""
     index.ensure_model("m-bad")
     index.ensure_model("m-alt")
     script = {"m-bad": [BAD_200] * 3}
@@ -664,8 +664,9 @@ def test_two_unrebutted_fidelity_fails_drop_model_from_ranking(index):
     router.route(["m-bad"], {"messages": []}, "retain")   # strike 2
     assert router.ranked(["m-bad", "m-alt"], "retain") == ["m-alt"]
     # Recovery has two layers and both are real: ONE success clears the
-    # fidelity GATE (unrebutted run broken), and the ordinary success-rate
-    # floors re-admit the model once its measured rate earns it back.
+    # fidelity COOLDOWN (read from the index, so any writer's success counts),
+    # and the ordinary success-rate floors re-admit the model once its
+    # measured rate earns it back.
     index.ensure_model("m-bad")
     index.record("m-bad", "retain", "probe", OK, 900.0)
     for _ in range(2):
@@ -687,8 +688,8 @@ def test_probe_verdict_reports_rejected_for_fidelity_fail(index):
     """Discovery consumes verdicts: a gated fidelity fail is a capability
     signal (same family as http reject), never `busy` — busy models get
     retried next pass; rejected pairs settle until their evidence goes stale.
-    The sample is recorded by _call either way, so unrebutted_fidelity_fails
-    gates the pair without any extra discovery logic."""
+    The sample is recorded by dial() either way, so the router's fidelity
+    cooldown gates the pair without any extra discovery logic."""
     script = {"m1": [BAD_200]}
     r, _ = make_router(index, script)
     verdict, detail = r.probe_verdict("m1", "retain", PROBE)

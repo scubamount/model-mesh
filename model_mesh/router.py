@@ -129,13 +129,6 @@ class RouterConfig:
     # http-400 = deterministic payload rejection) but 100% on consolidation.
     min_success_rate: float = 0.5
     min_samples_for_floor: int = 4
-    # Consecutive fidelity violations (an upstream 200 whose body violates the
-    # op_class JSON contract) that drop a model from an op_class until the
-    # recheck window elapses or one success intervenes. One strike is not a
-    # verdict — the cascade absorbs it and the client was served — but two
-    # unrebutted is the settled signal an http reject is. Mirrored in
-    # config.py DEFAULTS["router"]; test_config_defaults_match_dataclass
-    # asserts the two stay in sync.
     # Below this much remaining budget, a request-time dial is not attempted
     # at all. `min(request_timeout, _remaining())` otherwise hands the last
     # attempt a few seconds, and that attempt then times out for a reason that
@@ -241,6 +234,19 @@ class RouterConfig:
     # candidates.json this system replaced.
     tier_overrides: dict = field(default_factory=dict)
 
+    def request_timeout_for(self, op_class: Optional[str]) -> float:
+        """The request budget for one op_class -- THE lookup. Lives on the
+        config because the config owns the data; Router.request_timeout and
+        latency_ceiling_ms both delegate here, so the per-op_class override
+        cannot be read two ways."""
+        return self.request_timeout_s_by_op_class.get(
+            op_class, self.request_timeout_s)
+
+    def probe_timeout_for(self, op_class: Optional[str]) -> float:
+        """The probe budget for one op_class. See request_timeout_for."""
+        return self.probe_timeout_s_by_op_class.get(
+            op_class, self.probe_timeout_s)
+
     def latency_ceiling_ms(self, op_class: Optional[str] = None) -> float:
         """The eligibility latency ceiling for one op_class.
 
@@ -264,8 +270,7 @@ class RouterConfig:
         headroom fraction is that ratio, applied to whatever budget the
         op_class actually has.
         """
-        budget_s = self.request_timeout_s_by_op_class.get(
-            op_class, self.request_timeout_s)
+        budget_s = self.request_timeout_for(op_class)
         return min(
             max(self.max_p95_ms_for_eligibility,
                 budget_s * 1000.0 * _LATENCY_CEILING_FRACTION),
@@ -604,13 +609,11 @@ class Router:
         call site routes through these two, so an op_class cannot end up with
         a per-class probe budget and a retain-tuned request budget.
         """
-        return self.cfg.request_timeout_s_by_op_class.get(
-            op_class, self.cfg.request_timeout_s)
+        return self.cfg.request_timeout_for(op_class)
 
     def probe_timeout(self, op_class: Optional[str]) -> float:
         """The probe budget for one op_class. See request_timeout."""
-        return self.cfg.probe_timeout_s_by_op_class.get(
-            op_class, self.cfg.probe_timeout_s)
+        return self.cfg.probe_timeout_for(op_class)
 
     def eligible(self, model_id: str, op_class: Optional[str] = None) -> bool:
         b = self.index.breaker_get(model_id)
@@ -750,8 +753,9 @@ class Router:
             # available the cascade does better trying it than refusing it, and
             # the breaker still reacts if the failures cluster.
             if s is not None and s.n >= self.cfg.min_samples_for_floor:
-                timeout_ms = 1000.0 * self.cfg.request_timeout_s_by_op_class.get(
-                    op_class, self.cfg.request_timeout_s)
+                # Through request_timeout(), the single predicate every call
+                # site shares -- an inline restatement here could drift from it.
+                timeout_ms = 1000.0 * self.request_timeout(op_class)
                 expected_ms = (s.success_rate * s.p95_ms
                                + (1.0 - s.success_rate) * timeout_ms)
                 if expected_ms + timeout_ms > self.cfg.total_budget_s * 1000.0:
@@ -834,7 +838,19 @@ class Router:
         # sample, because a self-inflicted throttle hit is evidence about our
         # request pacing, not about the model. If the window ends inside the
         # budget, wait it out and dial with what remains.
-        budget = timeout or self.request_timeout(op_class)
+        #
+        # Explicit None check, not `timeout or default`: a caller that computed
+        # a ZERO grant must not be handed the full request timeout (`0.0 or 135`
+        # is 135). And a non-positive grant is refused outright rather than
+        # passed to the transport -- urllib reads 0 as non-blocking and a
+        # negative timeout raises -- and it records no sample, for the same
+        # reason a starved dial does not: running out of budget is ours.
+        budget = self.request_timeout(op_class) if timeout is None else timeout
+        if budget <= 0:
+            return None, Attempt(
+                model_id, "skipped-budget", None,
+                f"non-positive dial grant {budget:.1f}s",
+            )
         pause_left = self._provider_pause_until - time.time()
         if pause_left > 0:
             if pause_left >= budget - 1.0:
@@ -895,9 +911,10 @@ class Router:
             # The response still RETURNS here: this cascade already paid for
             # it, and refusing it would spend another full upstream call. What
             # changes is the evidence — the sample reads fidelity-fail, so the
-            # success-rate floor demotes the model and two violations without
-            # an intervening success drop it from the cascade entirely
-            # (eligible / unrebutted_fidelity_fails).
+            # success-rate floor demotes the model, and two consecutive
+            # violations arm a short per-(model, op_class) cooldown that drops
+            # it from ranked order until it expires or any success lands
+            # (_fidelity_fail / _fidelity_cooldown_left).
             ok, why = check_fidelity(payload, op_class)
             if not ok:
                 self.index.record(model_id, op_class, source,
@@ -1080,7 +1097,7 @@ class Router:
         }
         payload, att = self.dial(
             model_id, body, op_class, source="probe",
-            timeout=timeout or self.probe_timeout(op_class),
+            timeout=self.probe_timeout(op_class) if timeout is None else timeout,
         )
         if payload is None or att.status != OK:
             status = str(att.status or "")
@@ -1227,8 +1244,13 @@ class Router:
                     )
                     continue
                 if self.probe(model_id, op_class, probe_messages,
+                              # `probe_left` is the value the guard above
+                              # compared. Re-reading _remaining()/_box_left()
+                              # here is the check-to-dial gap grant_s closes
+                              # for request dials: time can pass in between,
+                              # and the re-read can go to zero or negative.
                               timeout=min(self.probe_timeout(op_class),
-                                          _remaining(), _box_left())):
+                                          probe_left)):
                     fresh.append(model_id)
             reprobed_any = bool(fresh)
             for model_id in fresh:
