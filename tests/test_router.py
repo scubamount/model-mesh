@@ -872,3 +872,31 @@ def test_sweep_respects_budget(index):
     dial_statuses = [a.status for a in res.attempts if a.status != "skipped-budget"]
     assert all(s != OK for s in dial_statuses)
 
+
+
+def test_sweep_skips_models_in_open_breaker_cooldown(index):
+    """A model whose breaker is open and still cooling down must not be swept:
+    re-dialing it re-fails it every request and never lets the ladder climb."""
+    index.ensure_model("a-live")
+    index.ensure_model("z-down")
+    index.breaker_set("z-down", state="down", consec_fails=5,
+                      cooldown_s=30.0, cooldown_until=time.time() + 30)
+    seen = []
+
+    def transport(url, body, headers, timeout):
+        seen.append(body["model"])
+        return 500, {}
+    r = Router(index, "http://up/v1", "k", RouterConfig(
+        max_attempts=1, reprobe_top_n=0), transport=transport)
+    r.route(["a-live", "z-down"], {"messages": []}, "retain", probe_messages=PROBE)
+    assert "z-down" not in seen
+
+
+def test_down_model_failing_again_climbs_cooldown_ladder(index):
+    index.ensure_model("m")
+    index.breaker_set("m", state="down", consec_fails=4,
+                      cooldown_s=30.0, cooldown_until=time.time() - 1)
+    r = Router(index, "http://up/v1", "k", RouterConfig(),
+               transport=lambda *a: (500, {}))
+    r._on_transient_fail("m")
+    assert index.breaker_get("m")["cooldown_s"] == 60.0

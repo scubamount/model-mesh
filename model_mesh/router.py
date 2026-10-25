@@ -819,7 +819,10 @@ class Router:
                 "cooldown_s=%.0f (failed recovery probe; doubled cooldown)",
                 model_id, consec, cd)
         elif consec >= self.cfg.breaker_threshold:
-            cd = self.cfg.breaker_cooldown_s
+            # Already down: climb the ladder instead of re-arming the first rung.
+            cd = (min(max(b["cooldown_s"], self.cfg.breaker_cooldown_s) * 2,
+                      self.cfg.breaker_cooldown_max_s)
+                  if b["state"] == "down" else self.cfg.breaker_cooldown_s)
             self.index.breaker_set(
                 model_id, state="down", consec_fails=consec,
                 cooldown_s=cd, cooldown_until=time.time() + cd,
@@ -1341,8 +1344,17 @@ class Router:
             for model_id in sweep_order:
                 if swept_count >= self.cfg.sweep_max_models:
                     break
-                if model_id in dialed or self.index.breaker_get(
-                        model_id)["state"] == "gone":
+                if model_id in dialed:
+                    continue
+                _b = self.index.breaker_get(model_id)
+                # 'gone' is terminal; an OPEN breaker still inside its cooldown
+                # is serving its timeout. Dialing it here re-failed the same
+                # dead model every request (observed 2026-10-25: gemma-4-31b-it
+                # down->down consec=96, 70-135s per dial, wedging hindsight
+                # consolidation) and reset its cooldown instead of laddering.
+                if _b["state"] == "gone" or (
+                        _b["state"] in ("down", "auth")
+                        and time.time() < _b["cooldown_until"]):
                     continue
                 left = _remaining()
                 if left <= 1.0 or left < self.cfg.min_useful_dial_s:
