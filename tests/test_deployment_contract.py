@@ -100,3 +100,14 @@ def test_mesh_home_relocates_every_state_path():
         assert path.startswith("/tmp/mesh-relocation-probe"), (
             f"{path} ignored MESH_HOME — state would split across two dirs"
         )
+
+
+def test_discovery_job_survives_boot_ordering():
+    """RunAtLoad fires the discovery curl at login, usually before the daemon
+    listens. Without a connect-refused retry it exits 7 and the pass is lost
+    until the next interval (observed after the 2026-10-27 reboot)."""
+    text = INSTALLER.read_text()
+    job = text[text.index("$LABEL_DISCOVER.plist\" <<EOF"):]
+    job = job[:job.index("\nEOF")]
+    assert "<string>--retry-connrefused</string>" in job
+    assert "<string>--retry</string>" in job

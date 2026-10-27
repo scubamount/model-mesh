@@ -149,6 +149,9 @@ EOF
 # skips models with no successes in the window, so a pass is a handful of
 # requests, not a catalog sweep — probing consumes shared free quota, so this
 # must never become "probe every model".
+# RunAtLoad fires this at login, often before the daemon is listening: curl
+# exit 7 (connection refused) and a lost pass until the next interval. Retry a
+# refused connect for ~60s; a live daemon answers on the first try, unchanged.
 cat > "$PLIST_DIR/$LABEL_DISCOVER.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -157,6 +160,9 @@ cat > "$PLIST_DIR/$LABEL_DISCOVER.plist" <<EOF
   <key>ProgramArguments</key><array>
     <string>/usr/bin/curl</string>
     <string>-s</string><string>-m</string><string>1800</string>
+    <string>--retry</string><string>6</string>
+    <string>--retry-delay</string><string>10</string>
+    <string>--retry-connrefused</string>
     <string>-X</string><string>POST</string>
     <string>http://$EFFECTIVE/mesh/probe</string>
   </array>
