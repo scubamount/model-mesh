@@ -260,7 +260,70 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
-def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
+_JSON_TYPES = {
+    "object": dict, "array": list, "string": str, "boolean": bool,
+    "integer": int, "number": (int, float), "null": type(None),
+}
+
+
+def caller_schema(request_body: Optional[dict]) -> Optional[dict]:
+    """The JSON schema the caller sent in `response_format`, if any.
+
+    Hindsight sends one on every structured call (litellm_llm.call ->
+    response_format={"type":"json_schema","json_schema":{"schema":...}}).
+    When present it IS the contract; op_class heuristics are only a fallback
+    for callers that send none (probes, plain clients).
+    """
+    if not isinstance(request_body, dict):
+        return None
+    rf = request_body.get("response_format")
+    if not isinstance(rf, dict) or rf.get("type") != "json_schema":
+        return None
+    js = rf.get("json_schema")
+    schema = js.get("schema") if isinstance(js, dict) else None
+    return schema if isinstance(schema, dict) else None
+
+
+def _type_ok(value, declared) -> bool:
+    names = declared if isinstance(declared, list) else [declared]
+    for name in names:
+        py = _JSON_TYPES.get(name)
+        if py is None:
+            return True            # unknown type keyword: do not judge
+        if isinstance(value, bool) and name in ("integer", "number"):
+            continue               # bool is an int subclass, not a JSON number
+        if isinstance(value, py):
+            return True
+    return False
+
+
+def check_against_schema(parsed, schema: dict) -> tuple[bool, str]:
+    """Top-level conformance: type, required keys, property types, enums.
+
+    Deliberately shallow. The question is "did the model answer the shape the
+    caller asked for", not full JSON-Schema validation; the caller validates
+    deeply itself and retries. Nested violations are the caller's call.
+    """
+    top = schema.get("type")
+    if top is not None and not _type_ok(parsed, top):
+        return False, f"schema: top-level is not {top}"
+    if not isinstance(parsed, dict):
+        return True, "ok"
+    missing = [k for k in schema.get("required", []) if k not in parsed]
+    if missing:
+        return False, f"schema: missing required {', '.join(missing)}"
+    for key, prop in (schema.get("properties") or {}).items():
+        if key not in parsed or not isinstance(prop, dict):
+            continue
+        if "type" in prop and not _type_ok(parsed[key], prop["type"]):
+            return False, f"schema: {key} is not {prop['type']}"
+        if "enum" in prop and parsed[key] not in prop["enum"]:
+            return False, f"schema: {key} not in enum"
+    return True, "ok"
+
+
+def check_fidelity(response: dict, op_class: str,
+                   request_body: Optional[dict] = None) -> tuple[bool, str]:
     """A model may serve an op_class only if it obeys the structured-output
     contract: non-empty content, valid JSON, expected shape. Reasoning models
     that leave `content` empty (output in reasoning_content) fail on purpose.
@@ -321,6 +384,20 @@ def check_fidelity(response: dict, op_class: str) -> tuple[bool, str]:
         parsed = json.loads(_strip_fences(content))
     except (json.JSONDecodeError, ValueError):
         return False, "content is not valid JSON (markdown/prose leak)"
+
+    # The caller's own schema outranks the op_class heuristic. Hindsight 1.1
+    # sends several shapes down ONE alias: consolidation now also issues a
+    # 1-by-1 dedup call answering {"action","text","reason"}, which the
+    # envelope heuristic scored "missing creates/updates/deletes" — 307 of
+    # 321 consolidation fidelity-fails in 24h (2026-10-27) were correct dedup
+    # answers, pushing 11 of 13 pool models under the success floor. And
+    # retain's "nothing worth remembering" is {"facts": []}, which the
+    # heuristic's non-empty rule rejected 110 times. Same class as the
+    # 2026-08-24 wipeout: a checker validating its own guess at the contract
+    # instead of the contract the caller declared.
+    schema = caller_schema(request_body)
+    if schema is not None:
+        return check_against_schema(parsed, schema)
 
     if op_class == "consolidation":
         if not isinstance(parsed, dict):

@@ -946,7 +946,7 @@ class Router:
             # violations arm a short per-(model, op_class) cooldown that drops
             # it from ranked order until it expires or any success lands
             # (_fidelity_fail / _fidelity_cooldown_left).
-            ok, why = check_fidelity(payload, op_class)
+            ok, why = check_fidelity(payload, op_class, body)
             if not ok:
                 self.index.record(model_id, op_class, source,
                                   FIDELITY_FAIL_STATUS, ms, payload_chars,

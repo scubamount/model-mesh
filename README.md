@@ -179,6 +179,14 @@ guessed:
   after exactly two dials because the main loop had one candidate to give.
   Unlike the reject gate, this cooldown is per-`(model, op_class)`: a model can
   obey one contract and not another.
+
+  **Which contract.** When the request carries
+  `response_format: {type: json_schema}`, that schema is the contract (top-level
+  type, required keys, property types, enums). The op_class heuristic (consolidation
+  envelope, non-empty `facts`) applies only to requests that declare no schema.
+  One alias carries several shapes — Hindsight 1.1's consolidation lane also sends
+  a `{action,text,reason}` dedup verdict — so a per-alias guess mis-scores correct
+  answers.
 - **Capability reject**: HTTP 400/413/422 means the provider parsed and
   refused the request shape — deterministic, retry pointless. Excluded from
   the op_class after two occurrences; the model stays eligible for others.
@@ -468,7 +476,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (432 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (448 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
