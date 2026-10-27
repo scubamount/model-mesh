@@ -372,12 +372,20 @@ def check_fidelity(response: dict, op_class: str,
             return True, "ok"
         return False, "empty content (reasoning-only or no output)"
 
-    if op_class == "reflect":
+    if op_class in ("reflect", "evolve") and caller_schema(request_body) is None:
         # Deliberately minimal. The only reflect failure a probe can see is
         # "said nothing" — which the empty-content check above already caught,
         # including the reasoning-model split (content empty, output in
         # reasoning_content). Anything stricter re-imports a format opinion the
         # caller does not hold, and that is the bug this branch exists to fix.
+        #
+        # Evolve is prose too. Its callers are DSPy (ChatAdapter replies in
+        # `[[ ## field ## ]]` sections, not JSON) and the evolve script's
+        # "Reply with the single word: ok" smoke check. The facts heuristic
+        # scored 144 such correct answers "not valid JSON" and 23 literal 'ok'
+        # replies as failures; 11 of 11 real evolve requests failed in the
+        # week to 2026-10-27. A DSPy JSONAdapter call declares response_format
+        # and is judged by that schema below instead.
         return True, "ok"
 
     try:

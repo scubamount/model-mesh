@@ -117,7 +117,7 @@ def test_probe_prompt_example_passes_its_own_checker():
 
 # -- retain/reflect keep the facts contract --------------------------------
 
-@pytest.mark.parametrize("op_class", ["retain", "evolve"])
+@pytest.mark.parametrize("op_class", ["retain"])
 def test_facts_contract_still_applies_to_other_op_classes(op_class):
     ok, why = check_fidelity(resp('{"facts": ["a"]}'), op_class)
     assert ok, why

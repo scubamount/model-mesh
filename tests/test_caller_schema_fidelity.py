@@ -132,3 +132,23 @@ def test_router_records_dedup_answer_as_ok(tmp_path):
     payload, att = r.dial("m/a", body(DEDUP_SCHEMA), "consolidation", source="request")
     assert payload is not None
     assert att.status == "ok", att
+
+
+# -- evolve is prose (DSPy ChatAdapter + smoke check) -------------------------
+
+def test_evolve_accepts_dspy_chatadapter_sections():
+    c = "[[ ## reasoning ## ]]\nThe skill requires...\n\n[[ ## completed ## ]]"
+    assert check_fidelity(resp(c), "evolve") == (True, "ok")
+
+
+def test_evolve_accepts_smoke_check_ok():
+    assert check_fidelity(resp("ok"), "evolve") == (True, "ok")
+
+
+def test_evolve_still_rejects_empty_content():
+    assert not check_fidelity(resp(None), "evolve")[0]
+
+
+def test_evolve_with_schema_is_judged_by_schema():
+    assert not check_fidelity(resp("plain prose"), "evolve", body(FACTS_SCHEMA))[0]
+    assert check_fidelity(resp('{"facts": []}'), "evolve", body(FACTS_SCHEMA))[0]

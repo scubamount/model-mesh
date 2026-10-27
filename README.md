@@ -434,9 +434,11 @@ aliases are `auto/retain`, `auto/consolidation`, `auto/reflect` and
 telemetry but no cascade.
 
 Scores are **per-op_class**, which is why the aliases are separate: one workload's
-traffic must not vote in the ranking that serves another. `auto/reflect`
-deliberately maps to the `retain` op_class (same contract, same evidence pool);
-`auto/evolve` gets its own.
+traffic must not vote in the ranking that serves another. Each alias has its
+own op_class. Without a declared `response_format` schema, `retain` and
+`consolidation` are judged as JSON (facts / creates-updates-deletes), while
+`reflect` and `evolve` are prose (Hindsight's reflect synthesis; DSPy
+ChatAdapter output) and need only non-empty content.
 
 ## Non-goals (v1)
 
@@ -476,7 +478,7 @@ deliberately maps to the `retain` op_class (same contract, same evidence pool);
   `ENV_VAR=value`, mode 0600). `launchctl setenv` does not survive a restart, so
   the file is the durable option; override its path with
   `MODEL_MESH_KEY_FALLBACK_FILE`.
-- Tests: `.venv/bin/python -m pytest` (449 tests; includes a sabotage matrix
+- Tests: `.venv/bin/python -m pytest` (452 tests; includes a sabotage matrix
   proving each routing guarantee fails loudly when its mechanism is removed).
 - **Backups.** `mesh.db` is *learned* state: sample history, breaker states and
   EOL marks accumulated from real traffic, reconstructible only by re-living
